@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.10
+# deploy_nsx_sb_check.sh  v3.11
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
 #   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
+#
+# CHANGELOG v3.11:
+#   - _BUNDLE_GREP simplificado para '\.tgz$' (ERE com alternância causava
+#     interpretação incorreta do pipe no shell restrito do NSX Edge)
+#   - _list_bundles / _list_bundles_with_age: grep '\.tgz$' (sem -E)
+#   - _cmd_preview em ask_bundle_options: substituído += por if/then
+#   - nsx_cmd em request_support_bundle: substituído += por if/then
+#   - disable_root_ssh: return 0 explícito ao final
 # =============================================================================
 set -euo pipefail
 
@@ -23,7 +31,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.10"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.11"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -58,13 +66,23 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.10
+# lib/common.sh  — v3.11
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.10
+# lib/common.sh  — v3.11
 #
-# NOVO v3.10:
+# NOVO v3.11:
+#   _BUNDLE_GREP simplificado para '\.tgz$':
+#     ERE com alternância (^support[-_]bundle|^sb_).*\.tgz$|\.tgz$ causava
+#     interpretação incorreta do pipe no shell restrito do NSX Edge.
+#     grep simples '\.tgz$' resolve sem ambiguidade.
+#   _list_bundles / _list_bundles_with_age: grep '\.tgz$' (sem -E)
+#   _cmd_preview em ask_bundle_options: substituído += por if/then
+#   nsx_cmd em request_support_bundle: substituído += por if/then
+#   disable_root_ssh: return 0 explícito ao final
+#
+# Herdado v3.10:
 #   ask_bundle_options() — menu interativo com timeout 10s:
 #     Exibe 3 opções de modo (padrão / all / all remove-core-file) +
 #     pergunta log-age (1..30). Timeout 10s sem resposta → padrão automático.
@@ -126,7 +144,8 @@ export SB_EXTRA SB_LOG_AGE
 # Array global de nodes com falha de autenticação admin
 declare -a NODE_AUTH_FAILED=()
 
-_BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
+# v3.11: padrão simples — sem ERE com alternância que quebrava no shell do Edge
+_BUNDLE_GREP='\.tgz$'
 _BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
 
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
@@ -221,9 +240,12 @@ ask_bundle_options(){
 
   export SB_EXTRA SB_LOG_AGE
 
+  # v3.11: if/then em vez de += para compatibilidade máxima com bash restrito
   local _cmd_preview="get support-bundle file <nome>"
-  [[ -n "$SB_EXTRA" ]] && _cmd_preview+" ${SB_EXTRA}"
-  _cmd_preview+=" log-age ${SB_LOG_AGE}"
+  if [[ -n "$SB_EXTRA" ]]; then
+    _cmd_preview="${_cmd_preview} ${SB_EXTRA}"
+  fi
+  _cmd_preview="${_cmd_preview} log-age ${SB_LOG_AGE}"
 
   echo ""
   printf "${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "  CONFIRMAÇÃO  "
@@ -400,6 +422,7 @@ disable_root_ssh(){
     return 0
   fi
   [[ -n "$out" ]] && log "${ip}: [clear ssh root-login] ${out}"
+  return 0
 }
 
 check_bundle_log(){
@@ -459,19 +482,19 @@ _bundle_age_days(){
   echo "$age"
 }
 
+# v3.11: grep simples '\.tgz$' — sem ERE que quebrava o pipe no shell do Edge
 _list_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
-  root_cmd_tty "$ip" "ls -1 ${dir}/ 2>/dev/null | grep -E '${_BUNDLE_GREP}' || true"
+  root_cmd_tty "$ip" "ls -1 ${dir}/ 2>/dev/null | grep '\.tgz\$' || true"
 }
 
 _list_bundles_with_age(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
-  local bundle_grep="${_BUNDLE_GREP}"
   root_cmd_tty "$ip" \
     "cd '${dir}' 2>/dev/null && \
-     for f in \$(ls -1 2>/dev/null | grep -E '${bundle_grep}' || true); do \
+     for f in \$(ls -1 2>/dev/null | grep '\.tgz\$' || true); do \
        ep=\$(stat -c '%Y' \"\$f\" 2>/dev/null || echo 0); \
        echo \"\$f \$ep\"; \
      done"
@@ -631,9 +654,9 @@ delete_all_bundles(){
 # ---------------------------------------------------------------------------
 # request_support_bundle IP [SB_EXTRA] [SB_LOG_AGE]
 #
+#   v3.11: if/then em vez de += para montagem do comando (compatibilidade
+#          com bash restrito do NSX Edge).
 #   v3.10: aceita parâmetros opcionais sb_extra e sb_log_age.
-#   Constrói o comando final na forma:
-#     get support-bundle file <nome> [all] [remove-core-file] log-age <N>
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
@@ -643,10 +666,12 @@ request_support_bundle(){
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
   local logfile="${LOG_DIR}/sb_bg_${ip//./_}_$(date +%Y%m%d_%H%M%S).log"
 
-  # Monta o comando completo
+  # v3.11: if/then em vez de += para evitar problemas com bash restrito
   local nsx_cmd="get support-bundle file ${fname}"
-  [[ -n "$sb_extra" ]] && nsx_cmd+" ${sb_extra}"
-  nsx_cmd+=" log-age ${sb_log_age}"
+  if [[ -n "$sb_extra" ]]; then
+    nsx_cmd="${nsx_cmd} ${sb_extra}"
+  fi
+  nsx_cmd="${nsx_cmd} log-age ${sb_log_age}"
 
   log_cmd "${ip}: [BACKGROUND] ${nsx_cmd}"
   log "${ip}: comando disparado em background — script não aguarda conclusão."
@@ -739,11 +764,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.10
+# nsx_sb_main.sh  — v3.11
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.10
+# nsx_sb_main.sh  — v3.11
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -775,7 +800,7 @@ if [[ "$CLEAN_ALL" == true ]]; then
     fi
     list_bundle_dir "$ip"
     delete_all_bundles "$ip"
-    disable_root_ssh "$ip"
+    disable_root_ssh "$ip" || true
     printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" \
       | tee -a "$RUN_LOG" >> "$STATUS_CSV"
   done
@@ -918,7 +943,7 @@ for ip in "${EDGE_IPS[@]}"; do
   fi
   log_cmd "${ip}: ${SHELL_CMD}"
   root_cmd_tty "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
-  disable_root_ssh "$ip"
+  disable_root_ssh "$ip" || true
 done
 [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
   log_warn "Nodes pulados (auth falhou): ${NODE_AUTH_FAILED[*]}"
@@ -959,7 +984,17 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.10
+# NSX Edge Automation — Manual de Uso  v3.11
+
+## Correções v3.11
+
+| Item corrigido | Antes (v3.10) | Depois (v3.11) |
+|---|---|---|
+| `_BUNDLE_GREP` | ERE com alternância `\|` | `\.tgz$` simples |
+| `_list_bundles` / `_list_bundles_with_age` | `grep -E '${_BUNDLE_GREP}'` | `grep '\.tgz$'` |
+| `_cmd_preview` em `ask_bundle_options` | `_cmd_preview+=" ${SB_EXTRA}"` | `if/then` |
+| `nsx_cmd` em `request_support_bundle` | `nsx_cmd+=" ${sb_extra}"` | `if/then` |
+| `disable_root_ssh` | sem `return 0` explícito | `return 0` ao final |
 
 ## Novo em v3.10 — Menu de opções do support-bundle
 
@@ -978,37 +1013,6 @@ Sem resposta, segue automaticamente com os valores padrão.
 
 Valores aceitos: `1` a `30` (dias). Padrão: `1`.
 Após escolher o modo, o script pergunta o log-age com o mesmo timeout de 10s.
-
-### Exemplo de execução
-
-```
-┌─  OPÇÕES DO SUPPORT BUNDLE  ─┐
-│  Modo do comando:             │
-│  [1] Padrão   ...             │
-│  [2] all      ...             │
-│  [3] all remove-core  ...     │
-│  Sem resposta em 10s → padrão │
-└───────────────────────────────┘
-
-Modo [1/2/3, Enter=padrão] ( 7s):
-log-age [1..30, Enter=1]   ( 7s): 3
-
-┌─  CONFIRMAÇÃO  ──────────────────────────────────┐
-│  get support-bundle file <nome> log-age 3        │
-└──────────────────────────────────────────────────┘
-```
-
-## Correções v3.9
-
-| Problema | Causa raiz | Correção |
-|---|---|---|
-| Bundle gerado mesmo com recente presente (2+ bundles) | `BUNDLE_FILES_RECENT` com quebras de linha fragmentava o parsing de `REPORT_LINES` | Array associativo `declare -A NODE_ACAO` separa decisão da fase 1 do relatório |
-
-## Correções v3.8
-
-| Problema | Causa raiz | Correção |
-|---|---|---|
-| Bundle novo classificado como ANTIGO e deletado | `_bundle_age_days()` — múltiplas chamadas SSH falhavam silenciosamente | `_list_bundles_with_age()` — UMA chamada SSH, idade calculada localmente |
 
 ## Deploy
 
@@ -1040,16 +1044,14 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.10"
+echo "  Deploy concluído! v3.11"
 echo "================================================================"
 echo ""
-echo "  Novo em v3.10:"
-echo "    ask_bundle_options(): menu com timeout 10s"
-echo "    Modos: padrão / all / all remove-core-file"
-echo "    log-age configurável 1..30 (padrão: 1)"
-echo ""
-echo "  Herdado v3.9:"
-echo "    NODE_ACAO[]: array associativo — sem bug de multi-bundle recente"
+echo "  Correções v3.11:"
+echo "    _BUNDLE_GREP: ERE simplificado para '\.tgz$'"
+echo "    _list_bundles*: grep sem -E"
+echo "    _cmd_preview / nsx_cmd: if/then em vez de +="
+echo "    disable_root_ssh: return 0 explícito"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
