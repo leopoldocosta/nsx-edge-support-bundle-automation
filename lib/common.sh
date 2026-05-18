@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# lib/common.sh  — v3.11
+# lib/common.sh  — v3.13
+#
+# FIX v3.13:
+#   _list_bundles(), _list_bundles_with_age(), delete_all_bundles() e
+#   delete_old_bundles(): substituição de root_cmd_tty → root_cmd (stderr
+#   descartado via 2>/dev/null) + filtro LOCAL grep '^sb_.*\.tgz$'.
+#
+#   O warning do cliente SSH:
+#     /etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
+#   era capturado via 2>&1 (root_cmd_tty) e entrava no stdout de
+#   _list_bundles(). O loop de deleção montava então o caminho:
+#     rm -f /var/vmware/nsx/file-store//etc/ssh/ssh_config line 59: ...
+#   em vez de apagar os arquivos .tgz reais, que permaneciam intactos.
+#
+#   Solução: root_cmd descarta stderr localmente; grep local '^sb_.*\.tgz$'
+#   garante que apenas nomes de arquivo válidos entrem no loop de deleção.
+#
+# FIX v3.12:
+#   check_bundle_status: detecção de processo passou a usar root_cmd
+#   (stderr=2>/dev/null) em vez de root_cmd_tty (stderr=2>&1).
 #
 # FIX v3.11:
-#   _list_bundles() e _list_bundles_with_age(): grep remoto simplificado
-#   para '\.tgz$'. O padrão ERE complexo com alternativas (^support[-_]bundle|
-#   ^sb_).*\.tgz$|\.tgz$ falhava silenciosamente no shell restrito do NSX
-#   Edge, causando que 'support-bundle_nsx-edge-XX.tgz' não fosse listado
-#   e portanto não deletado no --clean-all.
+#   _BUNDLE_GREP simplificado para '\.tgz$' (ERE com alternância
+#   causava interpretação incorreta no shell restrito do NSX Edge).
 #
 # Herdado v3.10:
 #   ask_bundle_options() — menu interativo com timeout 10s
-#   request_support_bundle() — aceita sb_extra e sb_log_age como parâmetros
+#   request_support_bundle() — aceita sb_extra e sb_log_age
 #
-# Herdado v3.9:
-#   NODE_ACAO[] — array associativo
-#
-# Herdado v3.8:
-#   _list_bundles_with_age() — UMA chamada SSH retorna "NOME EPOCH" por bundle
-#
-# Herdado v3.7:
-#   _BUNDLE_PROC_GREP preciso, LogLevel=ERROR, NODE_AUTH_FAILED[]
+# Herdado v3.9: NODE_ACAO[] — array associativo
+# Herdado v3.8: _list_bundles_with_age() — UMA chamada SSH
+# Herdado v3.7: _BUNDLE_PROC_GREP preciso, LogLevel=ERROR, NODE_AUTH_FAILED[]
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,11 +74,7 @@ export SB_EXTRA SB_LOG_AGE
 # Array global de nodes com falha de autenticação admin
 declare -a NODE_AUTH_FAILED=()
 
-# ---------------------------------------------------------------------------
-# FIX v3.11 — padrão simplificado para grep REMOTO no shell do NSX Edge.
-# O shell restrito do NSX não lida bem com alternativas ERE complexas em
-# pipe. '\.tgz$' captura todos os bundles (.tgz) sem ambiguidade.
-# ---------------------------------------------------------------------------
+# v3.11: padrão simples — sem ERE com alternância que quebrava no shell do Edge
 _BUNDLE_GREP='\.tgz$'
 _BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
 
@@ -372,47 +379,35 @@ list_bundle_dir(){
   echo ""
 }
 
-_bundle_age_days(){
-  local ip="$1" fpath="$2"
-  local now_epoch file_epoch age
-  file_epoch="$(root_cmd_tty "$ip" "stat -c '%Y' '${fpath}' 2>/dev/null || echo 0")"
-  now_epoch="$(root_cmd_tty "$ip" "date +%s")"
-  file_epoch="$(echo "${file_epoch}" | tr -cd '0-9')"
-  now_epoch="$(echo "${now_epoch}" | tr -cd '0-9')"
-  if [[ -z "$file_epoch" || "$file_epoch" == "0" || -z "$now_epoch" ]]; then
-    echo 999; return
-  fi
-  age=$(( (now_epoch - file_epoch) / 86400 ))
-  echo "$age"
-}
-
 # ---------------------------------------------------------------------------
 # _list_bundles IP
 #
-#   FIX v3.11: grep remoto simplificado para '\.tgz$'.
-#   O padrão ERE complexo anterior falhava silenciosamente no shell do NSX.
+# FIX v3.13: root_cmd (stderr descartado) + grep LOCAL '^sb_.*\.tgz$'.
+#   Impede que warnings do cliente SSH local entrem como nomes de arquivo.
 # ---------------------------------------------------------------------------
 _list_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
-  root_cmd_tty "$ip" "ls -1 '${dir}/' 2>/dev/null | grep '\.tgz$' || true"
+  # root_cmd descarta stderr; grep local filtra apenas nomes válidos de bundle
+  root_cmd "$ip" "ls -1 '${dir}/' 2>/dev/null || true" \
+    | grep '^sb_.*\.tgz$' || true
 }
 
 # ---------------------------------------------------------------------------
 # _list_bundles_with_age IP
 #
-#   FIX v3.11: grep remoto simplificado para '\.tgz$'.
-#   Uma única chamada SSH retorna "NOME EPOCH" para todos os .tgz.
+# FIX v3.13: root_cmd (stderr descartado) + grep LOCAL '^sb_.*\.tgz$'.
 # ---------------------------------------------------------------------------
 _list_bundles_with_age(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
-  root_cmd_tty "$ip" \
+  root_cmd "$ip" \
     "cd '${dir}' 2>/dev/null && \
      for f in \$(ls -1 2>/dev/null | grep '\.tgz\$' || true); do \
        ep=\$(stat -c '%Y' \"\$f\" 2>/dev/null || echo 0); \
        echo \"\$f \$ep\"; \
-     done"
+     done" \
+    | grep '^sb_.*\.tgz ' || true
 }
 
 check_bundle_status(){
@@ -426,8 +421,9 @@ check_bundle_status(){
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
   list_bundle_dir "$ip"
 
+  # v3.12: root_cmd (stderr descartado) — impede warning ssh_config no proc_out
   local proc_out
-  proc_out="$(root_cmd_tty "$ip" \
+  proc_out="$(root_cmd "$ip" \
     "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
   if [[ -n "$proc_out" ]]; then
     log_warn "${ip}: geração de bundle em andamento (processo detectado)."
@@ -525,6 +521,11 @@ check_bundle_status(){
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# delete_old_bundles IP
+#
+# FIX v3.13: root_cmd no rm -f (stderr descartado)
+# ---------------------------------------------------------------------------
 delete_old_bundles(){
   local ip="$1"
   [[ -z "$BUNDLE_FILES_OLD" ]] && return 0
@@ -532,7 +533,7 @@ delete_old_bundles(){
   while IFS= read -r fpath; do
     [[ -z "$fpath" ]] && continue
     log_cmd "${ip}: rm -f ${fpath}"
-    if root_cmd_tty "$ip" "rm -f '${fpath}'"; then
+    if root_cmd "$ip" "rm -f '${fpath}'"; then
       log_warn "${ip}: deletado — ${fpath}"
     else
       log_err "${ip}: falha ao deletar — ${fpath}"
@@ -540,6 +541,12 @@ delete_old_bundles(){
   done <<< "$BUNDLE_FILES_OLD"
 }
 
+# ---------------------------------------------------------------------------
+# delete_all_bundles IP
+#
+# FIX v3.13: _list_bundles já retorna apenas nomes válidos (^sb_.*\.tgz$).
+#   rm -f via root_cmd (stderr descartado).
+# ---------------------------------------------------------------------------
 delete_all_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -557,7 +564,7 @@ delete_all_bundles(){
     [[ -z "$f" ]] && continue
     local fpath="${dir}/${f}"
     log_cmd "${ip}: rm -f ${fpath}"
-    if root_cmd_tty "$ip" "rm -f '${fpath}'"; then
+    if root_cmd "$ip" "rm -f '${fpath}'"; then
       log_warn "${ip}: deletado — ${fpath}"
     else
       log_err "${ip}: falha ao deletar — ${fpath}"
