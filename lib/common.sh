@@ -1,36 +1,25 @@
 #!/usr/bin/env bash
-# lib/common.sh  — v3.8
+# lib/common.sh  — v3.10
 #
-# CORREÇÃO v3.8 — bug de classificação de bundles:
+# NOVO v3.10:
+#   ask_bundle_options() — menu interativo com timeout 10s:
+#     [1] Padrão / [2] all / [3] all remove-core-file  +  log-age 1..30
+#     Timeout 10s sem resposta → padrão automático (sem extra, log-age 1)
+#     Exporta SB_EXTRA e SB_LOG_AGE para uso em request_support_bundle().
+#   request_support_bundle() — aceita sb_extra e sb_log_age como parâmetros.
 #
-#   Causa raiz:
-#     _bundle_age_days() fazia UMA chamada SSH por arquivo (stat + date).
-#     Quando havia 2+ bundles, a segunda chamada SSH podia retornar string
-#     vazia ou falhar silenciosamente, fazendo age=999 (fallback), e o bundle
-#     NOVO era classificado como ANTIGO — era deletado erroneamente.
+# Herdado v3.9:
+#   NODE_ACAO[] — array associativo elimina bug de geração indesejada
+#     com 2+ bundles recentes (parsing de REPORT_LINES com pipe falhava).
 #
-#   Correção:
-#     Nova função _list_bundles_with_age() faz UMA ÚNICA chamada SSH que
-#     retorna "NOME EPOCH" para todos os bundles de uma vez, usando:
-#       stat -c '%n %Y' /var/vmware/nsx/file-store/*.tgz
-#     A idade é calculada localmente com a hora do próprio host.
-#     Zero chamadas SSH extras por arquivo.
-#
-#   Impacto:
-#     check_bundle_status() agora usa _list_bundles_with_age() em vez de
-#     _list_bundles() + _bundle_age_days() em loop.
-#     _bundle_age_days() mantida por compatibilidade mas não usada no fluxo
-#     principal.
+# Herdado v3.8:
+#   _list_bundles_with_age() — UMA chamada SSH retorna "NOME EPOCH" por bundle.
+#   Idade calculada localmente — sem age=999 em bundles novos.
 #
 # Herdado v3.7:
-#   - _BUNDLE_PROC_GREP preciso: gen_support_bundle|support_bundles/__self__.py
-#   - LogLevel=ERROR em ssh_admin/ssh_root
-#   - enable_root_ssh detecta Permission denied → NODE_AUTH_FAILED[]
-#   - nsx_sb_main.sh pula nodes em NODE_AUTH_FAILED[] em todas as fases
-#
-# Herdado v3.5:
-#   - _BUNDLE_GREP ampliado: support-bundle|support_bundle|sb_|*.tgz
-#   - Múltiplos bundles: classificação por idade, contagem, mix recente+antigo
+#   _BUNDLE_PROC_GREP preciso: gen_support_bundle|support_bundles/__self__.py
+#   LogLevel=ERROR em ssh_admin/ssh_root
+#   enable_root_ssh detecta Permission denied → NODE_AUTH_FAILED[]
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -66,24 +55,15 @@ BUNDLE_STATUS=""
 BUNDLE_FILES_RECENT=""
 BUNDLE_FILES_OLD=""
 
+# Parâmetros globais do support-bundle (populados por ask_bundle_options)
+SB_EXTRA=""
+SB_LOG_AGE=1
+export SB_EXTRA SB_LOG_AGE
+
 # Array global de nodes com falha de autenticação admin
 declare -a NODE_AUTH_FAILED=()
 
-# ---------------------------------------------------------------------------
-# _BUNDLE_GREP — padrão ERE para identificar arquivos de support bundle
-# Detecta: support-bundle*, support_bundle*, sb_*, e qualquer *.tgz
-# ---------------------------------------------------------------------------
 _BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
-
-# ---------------------------------------------------------------------------
-# _BUNDLE_PROC_GREP — padrão preciso para detectar geração em andamento
-# Processos reais observados no NSX durante geração de support bundle:
-#   sudo .../gen_support_bundle ...
-#   /bin/sh .../gen_support_bundle ...
-#   python3 .../support_bundles/__self__.py ...
-# NÃO usa padrões genéricos como 'support_bundle' que colidiriam com o
-# nome do diretório do próprio script.
-# ---------------------------------------------------------------------------
 _BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
 
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
@@ -103,11 +83,92 @@ _box_line(){
   printf '%s' "${out}"
 }
 
-# ---------------------------------------------------------------------------
-# _is_auth_failed OUTPUT
-# ---------------------------------------------------------------------------
 _is_auth_failed(){
   echo "$1" | grep -qiE 'permission denied|authentication failed|publickey|no supported authentication'
+}
+
+# ---------------------------------------------------------------------------
+# ask_bundle_options
+#
+#   Exibe menu interativo com timeout de 10 segundos por pergunta.
+#   Sem resposta → padrão automático: SB_EXTRA=""  SB_LOG_AGE=1
+#
+#   Opções de modo:
+#     [1] Padrão          → sem extra          (padrão)
+#     [2] all             → all
+#     [3] all remove-core → all remove-core-file
+#
+#   Em seguida pergunta log-age (1..30), também com timeout 10s.
+#   Ao final exibe box de confirmação com o comando que será usado.
+# ---------------------------------------------------------------------------
+ask_bundle_options(){
+  local width=74
+  local _mode="" _age="" _resp=""
+
+  echo ""
+  printf "${_C_BOX_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "  OPÇÕES DO SUPPORT BUNDLE  "
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" ""
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Modo do comando:"
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  [1] Padrão           get support-bundle file <nome> log-age <N>"
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  [2] all              get support-bundle file <nome> all log-age <N>"
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  [3] all remove-core  get support-bundle file <nome> all remove-core-file log-age <N>"
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" ""
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Sem resposta em 10s → padrão automático (modo 1, log-age 1)"
+  printf "${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
+  echo ""
+
+  # --- Pergunta modo (timeout 10s) ---
+  local _t
+  for _t in 10 9 8 7 6 5 4 3 2 1; do
+    printf "\r${_C_BLUE_BOLD}Modo [1/2/3, Enter=padrão] (%2ds): ${_C_RESET}" "$_t"
+    if IFS= read -r -t 1 _resp 2>/dev/null; then
+      _mode="$_resp"
+      break
+    fi
+  done
+  echo ""
+
+  case "${_mode:-1}" in
+    2) SB_EXTRA="all"                  ;;
+    3) SB_EXTRA="all remove-core-file" ;;
+    *) SB_EXTRA=""                     ;;
+  esac
+
+  # --- Pergunta log-age (timeout 10s) ---
+  _age=""
+  for _t in 10 9 8 7 6 5 4 3 2 1; do
+    printf "\r${_C_BLUE_BOLD}log-age [1..30, Enter=1] (%2ds): ${_C_RESET}" "$_t"
+    if IFS= read -r -t 1 _resp 2>/dev/null; then
+      _age="$_resp"
+      break
+    fi
+  done
+  echo ""
+
+  # Valida: aceita apenas inteiro 1..30; fora do range → 1
+  if [[ "${_age:-}" =~ ^[0-9]+$ ]] && (( _age >= 1 && _age <= 30 )); then
+    SB_LOG_AGE="$_age"
+  else
+    SB_LOG_AGE=1
+  fi
+
+  export SB_EXTRA SB_LOG_AGE
+
+  # Monta preview do comando para exibição (sem += que pode ser interpretado como cmd)
+  local _cmd_preview="get support-bundle file <nome>"
+  if [[ -n "$SB_EXTRA" ]]; then
+    _cmd_preview="${_cmd_preview} ${SB_EXTRA}"
+  fi
+  _cmd_preview="${_cmd_preview} log-age ${SB_LOG_AGE}"
+
+  echo ""
+  printf "${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "  CONFIRMAÇÃO  "
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Comando que será executado em cada Edge Node:"
+  printf "${_C_BOX_SIDE}│${_C_RESET}  ${_C_CYAN}%-*s${_C_RESET}${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  ${_cmd_preview}"
+  printf "${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
+  echo ""
+
+  log_ok "Opções definidas: SB_EXTRA='${SB_EXTRA:-<nenhum>}' | SB_LOG_AGE=${SB_LOG_AGE}"
 }
 
 collect_ips(){
@@ -202,11 +263,6 @@ prompt_clear_creds(){
   else clear_creds; fi
 }
 
-# ---------------------------------------------------------------------------
-# ssh_admin / ssh_root
-#   -o LogLevel=ERROR suprime warnings do cliente SSH local (ex: opções
-#   obsoletas no /etc/ssh/ssh_config do host de monitoramento).
-# ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
   export SSHPASS="${NSX_PASS}"
@@ -236,9 +292,6 @@ root_cmd(){      local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
 admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
 root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
-# ---------------------------------------------------------------------------
-# _node_auth_failed IP
-# ---------------------------------------------------------------------------
 _node_auth_failed(){
   local ip="$1"
   local f
@@ -248,9 +301,6 @@ _node_auth_failed(){
   return 1
 }
 
-# ---------------------------------------------------------------------------
-# enable_root_ssh IP
-# ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   local out rc=0
@@ -275,9 +325,6 @@ enable_root_ssh(){
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# disable_root_ssh IP
-# ---------------------------------------------------------------------------
 disable_root_ssh(){
   local ip="$1"
   local out rc=0
@@ -291,9 +338,6 @@ disable_root_ssh(){
   [[ -n "$out" ]] && log "${ip}: [clear ssh root-login] ${out}"
 }
 
-# ---------------------------------------------------------------------------
-# check_bundle_log IP
-# ---------------------------------------------------------------------------
 check_bundle_log(){
   local ip="$1"
   local log_file="/var/log/support_bundle.log"
@@ -317,9 +361,6 @@ check_bundle_log(){
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# list_bundle_dir IP
-# ---------------------------------------------------------------------------
 list_bundle_dir(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -340,10 +381,6 @@ list_bundle_dir(){
   echo ""
 }
 
-# ---------------------------------------------------------------------------
-# _bundle_age_days IP FILEPATH
-#   Mantida por compatibilidade. No fluxo principal, use _list_bundles_with_age.
-# ---------------------------------------------------------------------------
 _bundle_age_days(){
   local ip="$1" fpath="$2"
   local now_epoch file_epoch age
@@ -358,36 +395,16 @@ _bundle_age_days(){
   echo "$age"
 }
 
-# ---------------------------------------------------------------------------
-# _list_bundles IP
-#   Retorna apenas os nomes dos arquivos .tgz (um por linha).
-# ---------------------------------------------------------------------------
 _list_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
   root_cmd_tty "$ip" "ls -1 ${dir}/ 2>/dev/null | grep -E '${_BUNDLE_GREP}' || true"
 }
 
-# ---------------------------------------------------------------------------
-# _list_bundles_with_age IP
-#
-#   FIX v3.8 — uma única chamada SSH retorna "NOME EPOCH" para todos os
-#   bundles, usando stat em glob. A idade é calculada localmente com
-#   $(date +%s) do host de monitoramento, evitando múltiplas conexões SSH
-#   por arquivo que falhavam silenciosamente com strings vazias → age=999.
-#
-#   Saída (stdout): linhas no formato "NOME_DO_ARQUIVO EPOCH"
-#   Exemplo:
-#     bundle-edge019.tgz 1648396800
-#     sb_172_18_214_19_20260514_175712.tgz 1747267200
-# ---------------------------------------------------------------------------
 _list_bundles_with_age(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
   local bundle_grep="${_BUNDLE_GREP}"
-
-  # Uma chamada SSH: lista todos .tgz, filtra pelo padrão de bundles,
-  # e retorna "basename epoch" de cada arquivo.
   root_cmd_tty "$ip" \
     "cd '${dir}' 2>/dev/null && \
      for f in \$(ls -1 2>/dev/null | grep -E '${bundle_grep}' || true); do \
@@ -396,13 +413,6 @@ _list_bundles_with_age(){
      done"
 }
 
-# ---------------------------------------------------------------------------
-# check_bundle_status IP
-#
-#   FIX v3.8: usa _list_bundles_with_age() — UMA chamada SSH retorna todos
-#   os bundles com seu epoch. Idade calculada localmente. Elimina o problema
-#   de múltiplas chamadas SSH falhando silenciosamente e causando age=999.
-# ---------------------------------------------------------------------------
 check_bundle_status(){
   local ip="$1"
   BUNDLE_STATUS="none"
@@ -414,7 +424,6 @@ check_bundle_status(){
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
   list_bundle_dir "$ip"
 
-  # Detecta geração em andamento usando padrão preciso (_BUNDLE_PROC_GREP)
   local proc_out
   proc_out="$(root_cmd_tty "$ip" \
     "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
@@ -424,10 +433,8 @@ check_bundle_status(){
     BUNDLE_STATUS="inprogress"; return 0
   fi
 
-  # Uma única chamada SSH: retorna "nome epoch" por bundle
   local raw_pairs
   raw_pairs="$(_list_bundles_with_age "$ip")"
-  # Extrai apenas os nomes para o log de detecção
   local all_bundles
   all_bundles="$(echo "$raw_pairs" | awk '{print $1}' | grep -v '^$' || true)"
 
@@ -442,7 +449,6 @@ check_bundle_status(){
   bundle_count="$(echo "$all_bundles" | grep -c '.' || true)"
   log "${ip}: ${bundle_count} bundle(s) encontrado(s)."
 
-  # Calcula idade localmente (evita SSH extra por arquivo)
   local now_epoch
   now_epoch="$(date +%s)"
 
@@ -452,16 +458,13 @@ check_bundle_status(){
     fname="$(echo "$pair" | awk '{print $1}')"
     fepoch="$(echo "$pair" | awk '{print $2}' | tr -cd '0-9')"
     [[ -z "$fname" ]] && continue
-
     if [[ -z "$fepoch" || "$fepoch" == "0" ]]; then
       age=999
     else
       age=$(( (now_epoch - fepoch) / 86400 ))
     fi
-
     fpath="${dir}/${fname}"
     log "${ip}: arquivo '${fname}' → ${age} dia(s)."
-
     if [[ "$age" -le 7 ]]; then
       BUNDLE_FILES_RECENT+="${fpath}"$'\n'
     else
@@ -520,9 +523,6 @@ check_bundle_status(){
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# delete_old_bundles IP
-# ---------------------------------------------------------------------------
 delete_old_bundles(){
   local ip="$1"
   [[ -z "$BUNDLE_FILES_OLD" ]] && return 0
@@ -538,9 +538,6 @@ delete_old_bundles(){
   done <<< "$BUNDLE_FILES_OLD"
 }
 
-# ---------------------------------------------------------------------------
-# delete_all_bundles IP  (--clean-all)
-# ---------------------------------------------------------------------------
 delete_all_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -568,14 +565,28 @@ delete_all_bundles(){
 }
 
 # ---------------------------------------------------------------------------
-# request_support_bundle IP
+# request_support_bundle IP [sb_extra] [sb_log_age]
+#
+#   v3.10: aceita parâmetros opcionais sb_extra e sb_log_age.
+#   Constrói o comando final na forma:
+#     get support-bundle file <nome> [all] [remove-core-file] log-age <N>
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
+  local sb_extra="${2:-${SB_EXTRA:-}}"
+  local sb_log_age="${3:-${SB_LOG_AGE:-1}}"
+
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
   local logfile="${LOG_DIR}/sb_bg_${ip//./_}_$(date +%Y%m%d_%H%M%S).log"
 
-  log_cmd "${ip}: [BACKGROUND] get support-bundle file ${fname} log-age 1"
+  # Monta o comando — sem += para evitar interpretação como comando pelo shell
+  local nsx_cmd="get support-bundle file ${fname}"
+  if [[ -n "$sb_extra" ]]; then
+    nsx_cmd="${nsx_cmd} ${sb_extra}"
+  fi
+  nsx_cmd="${nsx_cmd} log-age ${sb_log_age}"
+
+  log_cmd "${ip}: [BACKGROUND] ${nsx_cmd}"
   log "${ip}: comando disparado em background — script não aguarda conclusão."
   log "${ip}: saída em: ${logfile}"
 
@@ -589,7 +600,7 @@ request_support_bundle(){
       -o ServerAliveInterval=30 \
       -o ServerAliveCountMax=120 \
       "${NSX_USER}@${ip}" \
-      "get support-bundle file ${fname} log-age 1" \
+      "${nsx_cmd}" \
       > "${logfile}" 2>&1
     echo "[$(date '+%F %T')] [OK] Bundle concluído: ${fname}" >> "${logfile}"
   ) &
