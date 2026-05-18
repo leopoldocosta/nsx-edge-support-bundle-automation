@@ -1,41 +1,46 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.13
+# deploy_nsx_sb_check.sh  v3.14
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
 #   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 #
+# CHANGELOG v3.14:
+#   - _list_bundles(): grep ampliado de '^sb_.*\.tgz$' → '\.tgz$'.
+#     Arquivos com prefixo 'support-bundle-*' eram invisíveis para
+#     delete_all_bundles() e também para check_bundle_status(), que
+#     via 3 arquivos no ls -lh mas contava apenas 1 no loop de deleção.
+#
+#   - delete_all_bundles(): substituição de
+#       while IFS= read -r f; do ... done <<< "$all_files"
+#     por
+#       mapfile -t _del_files <<< "$all_files"; for f in "${_del_files[@]}"
+#     Com set -euo pipefail, o while abortava silenciosamente após a
+#     primeira iteração quando root_cmd retornava rc não-zero internamente,
+#     deletando apenas o primeiro arquivo e declarando "limpeza concluída".
+#
+#   - delete_old_bundles(): mesma correção mapfile aplicada ao loop
+#     que itera sobre BUNDLE_FILES_OLD (caminhos completos).
+#
+#   - _list_bundles_with_age(): grep ampliado de '^sb_.*\.tgz ' → '\.tgz '
+#     para consistência — check_bundle_status() também passa a enxergar
+#     arquivos support-bundle-* ao calcular idade/recência.
+#
 # CHANGELOG v3.13:
 #   - _list_bundles(), _list_bundles_with_age(), delete_all_bundles() e
 #     delete_old_bundles(): substituição de root_cmd_tty → root_cmd (stderr
 #     descartado via 2>/dev/null) + filtro LOCAL grep '^sb_.*\.tgz$'.
-#
-#     O warning do cliente SSH:
-#       /etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
-#     era capturado via 2>&1 (root_cmd_tty) e entrava no stdout de
-#     _list_bundles(). O loop de deleção montava então o caminho:
-#       rm -f /var/vmware/nsx/file-store//etc/ssh/ssh_config line 59: ...
-#     em vez de apagar os arquivos .tgz reais, que permaneciam intactos.
-#
-#     Solução: root_cmd descarta stderr localmente; grep local '^sb_.*\.tgz$'
-#     garante que apenas nomes de arquivo válidos entrem no loop de deleção.
+#     Elimina contaminação do stdout pelo warning SSH do cliente local.
 #
 # CHANGELOG v3.12:
 #   - check_bundle_status: detecção de processo usa root_cmd (stderr descartado)
 #     em vez de root_cmd_tty (stderr misturado ao stdout).
-#     Elimina falso positivo "bundle em andamento" causado pelo aviso do cliente
-#     SSH: /etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
-#     que aparecia como conteúdo de $proc_out e disparava BUNDLE_STATUS=inprogress
-#     mesmo quando nenhum processo de bundle estava rodando.
 #
 # CHANGELOG v3.11:
-#   - _BUNDLE_GREP simplificado para '\.tgz$' (ERE com alternância causava
-#     interpretação incorreta do pipe no shell restrito do NSX Edge)
-#   - _list_bundles / _list_bundles_with_age: grep '\.tgz$' (sem -E)
-#   - _cmd_preview em ask_bundle_options: substituído += por if/then
-#   - nsx_cmd em request_support_bundle: substituído += por if/then
+#   - _BUNDLE_GREP simplificado para '\.tgz$'
+#   - _cmd_preview / nsx_cmd: substituído += por if/then
 #   - disable_root_ssh: return 0 explícito ao final
 # =============================================================================
 set -euo pipefail
@@ -54,7 +59,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.13"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.14"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -89,42 +94,38 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.13
+# lib/common.sh  — v3.14
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.13
+# lib/common.sh  — v3.14
+#
+# FIX v3.14:
+#   _list_bundles(): grep '\.tgz$' (era '^sb_.*\.tgz$').
+#     Arquivos 'support-bundle-*' eram invisíveis → ignorados no --clean-all.
+#
+#   _list_bundles_with_age(): grep '\.tgz ' (era '^sb_.*\.tgz ').
+#     Consistência com _list_bundles(); check_bundle_status() passa a
+#     enxergar e classificar arquivos support-bundle-* por idade.
+#
+#   delete_all_bundles(): while read → mapfile + for.
+#     Com set -euo pipefail o while abortava após a 1ª iteração,
+#     deletando apenas o primeiro arquivo.
+#
+#   delete_old_bundles(): mesma correção mapfile para BUNDLE_FILES_OLD.
 #
 # FIX v3.13:
-#   _list_bundles(), _list_bundles_with_age(), delete_all_bundles() e
-#   delete_old_bundles(): substituição de root_cmd_tty → root_cmd (stderr
-#   descartado via 2>/dev/null) + filtro LOCAL grep '^sb_.*\.tgz$'.
-#
-#   O warning do cliente SSH:
-#     /etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
-#   era capturado via 2>&1 (root_cmd_tty) e entrava no stdout de
-#   _list_bundles(). O loop de deleção montava então o caminho:
-#     rm -f /var/vmware/nsx/file-store//etc/ssh/ssh_config line 59: ...
-#   em vez de apagar os arquivos .tgz reais, que permaneciam intactos.
-#
-#   Solução: root_cmd descarta stderr localmente; grep local '^sb_.*\.tgz$'
-#   garante que apenas nomes de arquivo válidos entrem no loop de deleção.
+#   root_cmd_tty → root_cmd (stderr=2>/dev/null) em _list_bundles,
+#   _list_bundles_with_age, delete_all_bundles, delete_old_bundles.
+#   Elimina contaminação do stdout pelo warning SSH do cliente local.
 #
 # FIX v3.12:
-#   check_bundle_status: detecção de processo passou a usar root_cmd
-#   (stderr=2>/dev/null) em vez de root_cmd_tty (stderr=2>&1).
+#   check_bundle_status: root_cmd (stderr=2>/dev/null) elimina falso
+#   positivo "bundle em andamento".
 #
 # FIX v3.11:
-#   _BUNDLE_GREP simplificado para '\.tgz$' (ERE com alternância
-#   causava interpretação incorreta no shell restrito do NSX Edge).
-#
-# Herdado v3.10:
-#   ask_bundle_options() — menu interativo com timeout 10s
-#   request_support_bundle() — aceita sb_extra e sb_log_age
-#
-# Herdado v3.9: NODE_ACAO[] — array associativo
-# Herdado v3.8: _list_bundles_with_age() — UMA chamada SSH
-# Herdado v3.7: _BUNDLE_PROC_GREP preciso, LogLevel=ERROR, NODE_AUTH_FAILED[]
+#   _BUNDLE_GREP simplificado; _cmd_preview / nsx_cmd: += → if/then;
+#   disable_root_ssh: return 0 explícito.
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -160,16 +161,12 @@ BUNDLE_STATUS=""
 BUNDLE_FILES_RECENT=""
 BUNDLE_FILES_OLD=""
 
-# Parâmetros globais do support-bundle (populados por ask_bundle_options)
 SB_EXTRA=""
 SB_LOG_AGE=1
 export SB_EXTRA SB_LOG_AGE
 
-# Array global de nodes com falha de autenticação admin
 declare -a NODE_AUTH_FAILED=()
 
-# v3.11: padrão simples — sem ERE com alternância que quebrava no shell do Edge
-_BUNDLE_GREP='\.tgz$'
 _BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
 
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
@@ -476,29 +473,15 @@ list_bundle_dir(){
   echo ""
 }
 
-_bundle_age_days(){
-  local ip="$1" fpath="$2"
-  local now_epoch file_epoch age
-  file_epoch="$(root_cmd_tty "$ip" "stat -c '%Y' '${fpath}' 2>/dev/null || echo 0")"
-  now_epoch="$(root_cmd_tty "$ip" "date +%s")"
-  file_epoch="$(echo "${file_epoch}" | tr -cd '0-9')"
-  now_epoch="$(echo "${now_epoch}" | tr -cd '0-9')"
-  if [[ -z "$file_epoch" || "$file_epoch" == "0" || -z "$now_epoch" ]]; then
-    echo 999; return
-  fi
-  age=$(( (now_epoch - file_epoch) / 86400 ))
-  echo "$age"
-}
-
-# v3.13: root_cmd (stderr=2>/dev/null) + filtro LOCAL grep '^sb_.*\.tgz$'
-# Elimina contaminação do stdout pelo warning SSH do cliente local.
+# v3.14: grep '\.tgz$' — captura qualquer .tgz (inclusive support-bundle-*)
 _list_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
   root_cmd "$ip" "ls -1 ${dir}/ 2>/dev/null || true" \
-    | grep '^sb_.*\.tgz$' || true
+    | grep '\.tgz$' || true
 }
 
+# v3.14: grep '\.tgz ' — consistência com _list_bundles
 _list_bundles_with_age(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -509,7 +492,7 @@ _list_bundles_with_age(){
        ep=\$(stat -c '%Y' \"\$f\" 2>/dev/null || echo 0); \
        echo \"\$f \$ep\"; \
      done")"
-  echo "$raw" | grep '^sb_.*\.tgz ' || true
+  echo "$raw" | grep '\.tgz ' || true
 }
 
 check_bundle_status(){
@@ -523,7 +506,6 @@ check_bundle_status(){
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
   list_bundle_dir "$ip"
 
-  # v3.12: root_cmd (stderr=2>/dev/null) — evita falso positivo de "bundle em andamento"
   local proc_out
   proc_out="$(root_cmd "$ip" \
     "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
@@ -623,12 +605,15 @@ check_bundle_status(){
   return 0
 }
 
-# v3.13: root_cmd (stderr=2>/dev/null) no rm -f
+# v3.14: mapfile + for — elimina abort precoce do while com set -euo pipefail
 delete_old_bundles(){
   local ip="$1"
   [[ -z "$BUNDLE_FILES_OLD" ]] && return 0
   log "${ip}: deletando bundle(s) antigo(s)..."
-  while IFS= read -r fpath; do
+  local _del_old=()
+  mapfile -t _del_old <<< "$BUNDLE_FILES_OLD"
+  local fpath
+  for fpath in "${_del_old[@]}"; do
     [[ -z "$fpath" ]] && continue
     log_cmd "${ip}: rm -f ${fpath}"
     if root_cmd "$ip" "rm -f '${fpath}'"; then
@@ -636,10 +621,10 @@ delete_old_bundles(){
     else
       log_err "${ip}: falha ao deletar — ${fpath}"
     fi
-  done <<< "$BUNDLE_FILES_OLD"
+  done
 }
 
-# v3.13: root_cmd (stderr=2>/dev/null) no rm -f
+# v3.14: grep '\.tgz$' em _list_bundles + mapfile + for
 delete_all_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -653,16 +638,19 @@ delete_all_bundles(){
   local count
   count="$(echo "$all_files" | grep -c '.' || true)"
   log "${ip}: ${count} bundle(s) para deletar."
-  while IFS= read -r f; do
+  local _del_files=()
+  mapfile -t _del_files <<< "$all_files"
+  local f fpath
+  for f in "${_del_files[@]}"; do
     [[ -z "$f" ]] && continue
-    local fpath="${dir}/${f}"
+    fpath="${dir}/${f}"
     log_cmd "${ip}: rm -f ${fpath}"
     if root_cmd "$ip" "rm -f '${fpath}'"; then
       log_warn "${ip}: deletado — ${fpath}"
     else
       log_err "${ip}: falha ao deletar — ${fpath}"
     fi
-  done <<< "$all_files"
+  done
   log_ok "${ip}: limpeza total concluída."
 }
 
@@ -774,11 +762,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.13
+# nsx_sb_main.sh  — v3.14
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.13
+# nsx_sb_main.sh  — v3.14
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -790,7 +778,6 @@ load_ips; ask_admin_creds; ask_root_creds
 CLEAN_ALL=false
 [[ "${1:-}" == "--clean-all" ]] && CLEAN_ALL=true
 
-# Menu interativo de opções do support-bundle (timeout 10s → padrão automático)
 ask_bundle_options
 
 RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
@@ -994,45 +981,40 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.13
+# NSX Edge Automation — Manual de Uso  v3.14
+
+## Correções v3.14
+
+| Item corrigido | Antes (v3.13) | Depois (v3.14) |
+|---|---|---|
+| `_list_bundles()` | `grep '^sb_.*\.tgz$'` | `grep '\.tgz$'` — captura `support-bundle-*` |
+| `_list_bundles_with_age()` | `grep '^sb_.*\.tgz '` | `grep '\.tgz '` — consistência |
+| `delete_all_bundles()` loop | `while read … done <<< $var` | `mapfile -t _del_files` + `for` |
+| `delete_old_bundles()` loop | `while read … done <<< $var` | `mapfile -t _del_old` + `for` |
+
+### Sintomas eliminados
+
+**Bug 1 — arquivos ignorados no --clean-all:**
+Arquivos com prefixo `support-bundle-*` não correspondiam ao padrão
+`'^sb_.*\.tgz$'` e eram invisíveis para `_list_bundles()`.
+O log mostrava "3 bundle(s) para deletar" mas só 3 dos `sb_*` eram
+listados — os `support-bundle-*` nunca entravam no loop.
+
+**Bug 2 — loop de deleção abortava após 1º arquivo:**
+Com `set -euo pipefail`, o `while IFS= read -r f; do … done <<< "$var"`
+abortava silenciosamente quando qualquer subcomando interno retornava
+rc≠0, deletando apenas o primeiro arquivo e imprimindo
+"limpeza total concluída" prematuramente.
+`mapfile` + `for` resolve porque o array já está populado antes do loop.
 
 ## Correções v3.13
 
 | Item corrigido | Antes (v3.12) | Depois (v3.13) |
 |---|---|---|
-| `_list_bundles()` | `root_cmd_tty` + grep remoto | `root_cmd` + grep local `'^sb_.*\.tgz$'` |
-| `_list_bundles_with_age()` | `root_cmd_tty` + grep remoto | `root_cmd` + grep local `'^sb_.*\.tgz '` |
-| `delete_old_bundles()` — `rm -f` | `root_cmd_tty` (stderr=2>&1) | `root_cmd` (stderr=2>/dev/null) |
-| `delete_all_bundles()` — `rm -f` | `root_cmd_tty` (stderr=2>&1) | `root_cmd` (stderr=2>/dev/null) |
-
-### Sintoma eliminado
-
-O warning do cliente SSH local:
-```
-/etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
-```
-era capturado via `2>&1` (`root_cmd_tty`) e entrava no stdout de `_list_bundles()`.
-O loop de deleção montava então o caminho:
-```
-rm -f /var/vmware/nsx/file-store//etc/ssh/ssh_config line 59: ...
-```
-em vez de apagar os arquivos `.tgz` reais, que permaneciam intactos.
-
-## Correções v3.12
-
-| Item corrigido | Antes (v3.11) | Depois (v3.12) |
-|---|---|---|
-| `check_bundle_status` — detecção de processo | `root_cmd_tty` (stderr=2>&1, aviso SSH contaminava `$proc_out`) | `root_cmd` (stderr=2>/dev/null, somente stdout do processo remoto) |
-
-## Correções v3.11
-
-| Item corrigido | Antes (v3.10) | Depois (v3.11) |
-|---|---|---|
-| `_BUNDLE_GREP` | ERE com alternância `\|` | `\.tgz$` simples |
-| `_list_bundles` / `_list_bundles_with_age` | `grep -E '${_BUNDLE_GREP}'` | `grep '\.tgz$'` |
-| `_cmd_preview` em `ask_bundle_options` | `_cmd_preview+=" ${SB_EXTRA}"` | `if/then` |
-| `nsx_cmd` em `request_support_bundle` | `nsx_cmd+=" ${sb_extra}"` | `if/then` |
-| `disable_root_ssh` | sem `return 0` explícito | `return 0` ao final |
+| `_list_bundles()` | `root_cmd_tty` + grep remoto | `root_cmd` + grep local |
+| `_list_bundles_with_age()` | `root_cmd_tty` | `root_cmd` |
+| `delete_old_bundles()` rm -f | `root_cmd_tty` | `root_cmd` |
+| `delete_all_bundles()` rm -f | `root_cmd_tty` | `root_cmd` |
 
 ## Deploy
 
@@ -1064,16 +1046,14 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.13"
+echo "  Deploy concluído! v3.14"
 echo "================================================================"
 echo ""
-echo "  Correções v3.13:"
-echo "    _list_bundles / _list_bundles_with_age: root_cmd + grep local '^sb_.*\.tgz$'"
-echo "    delete_old_bundles / delete_all_bundles: root_cmd no rm -f"
-echo "    Elimina bug onde warning SSH contaminava stdout de _list_bundles()"
-echo "    e o loop de deleção montava caminhos inválidos em vez de remover .tgz"
+echo "  Correções v3.14:"
+echo "    _list_bundles / _list_bundles_with_age: grep '\.tgz\$' — captura support-bundle-*"
+echo "    delete_all_bundles / delete_old_bundles: mapfile + for — deleta todos os arquivos"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
-echo "  2. cd ${AUTO_DIR} && ./nsx_sb_main.sh"
+echo "  2. cd ${AUTO_DIR} && ./nsx_sb_main.sh --clean-all"
 echo ""
