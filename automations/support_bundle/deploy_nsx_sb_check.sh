@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.15
+# deploy_nsx_sb_check.sh  v3.16
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
 #   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 #
-# CHANGELOG v3.15:
-#   - Novo script nsx_sb_precheck.sh:
-#     Executa APENAS o pre-check em todos os Edge Nodes (habilita root
-#     SSH, verifica bundles por idade, desabilita root SSH) e exibe
-#     relatório final com tabela + CSV. Nenhuma geração ou deleção de
-#     bundle é realizada. Útil para auditar o estado dos nodes antes de
-#     decidir se é necessário rodar o fluxo completo.
+# CHANGELOG v3.16:
+#   - check_bundle_status(): exporta BUNDLE_DATE_RECENT e BUNDLE_DATE_OLD
+#     com a data YYYY-MM-DD do bundle mais recente de cada categoria.
+#   - Tabela de relatório: coluna STATUS exibe a data real do arquivo
+#     (ex.: 2026-05-12) no lugar de "RECENTE (≤7d)" / "ANTIGO (>7d)".
+#   - _print_report(): detecção de cor por prefixo de data (YYYY-)
+#     e palavras-chave existentes (EM ANDAMENTO, AUTH FALHOU, NENHUM).
 #
-#   - nsx_sb_main.sh: nova flag --precheck-only.
-#     Executa somente a fase de pre-check e exibe o relatório, sem
-#     disparar ask_bundle_options nem request_support_bundle.
-#     Equivalente a rodar nsx_sb_precheck.sh diretamente.
+# CHANGELOG v3.15:
+#   - Novo script nsx_sb_precheck.sh.
+#   - nsx_sb_main.sh: flag --precheck-only.
+#   - common.sh: _print_report() reutilizável.
 #
 # CHANGELOG v3.14:
-#   - _list_bundles(): grep '\\.tgz$' — captura support-bundle-*
-#   - _list_bundles_with_age(): grep '\\.tgz ' — consistência
+#   - _list_bundles(): grep '\.tgz$'
+#   - _list_bundles_with_age(): grep '\.tgz '
 #   - delete_all_bundles() e delete_old_bundles(): mapfile + for
 # =============================================================================
 set -euo pipefail
@@ -41,7 +41,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.15"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.16"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -77,28 +77,27 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.15 (sem alterações funcionais em relação à v3.14)
+# lib/common.sh  — v3.16
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.15
+# lib/common.sh  — v3.16
 #
-# Sem alterações funcionais em relação à v3.14.
-# Versão incrementada para acompanhar o kit.
+# NOVO v3.16:
+#   check_bundle_status(): exporta BUNDLE_DATE_RECENT e BUNDLE_DATE_OLD
+#   com a data YYYY-MM-DD derivada do fepoch do bundle mais recente
+#   de cada categoria. Usada nos relatórios para exibir a data real
+#   do arquivo no lugar de "RECENTE (≤7d)" / "ANTIGO (>7d)".
 #
-# FIX v3.14:
-#   _list_bundles(): grep '\.tgz$' (era '^sb_.*\.tgz$').
-#   _list_bundles_with_age(): grep '\.tgz ' — consistência.
-#   delete_all_bundles() e delete_old_bundles(): mapfile + for.
+#   _print_report(): detecção de cor ajustada — datas (YYYY-) são
+#   tratadas como verde (recente) ou amarelo (antigo) com base no
+#   campo de arquivo; palavras-chave existentes mantidas.
 #
-# FIX v3.13:
-#   root_cmd_tty → root_cmd (stderr=2>/dev/null).
-#
-# FIX v3.12:
-#   check_bundle_status: root_cmd elimina falso positivo "inprogress".
-#
-# FIX v3.11:
-#   _BUNDLE_GREP simplificado; += → if/then; disable_root_ssh: return 0.
+# v3.15: nsx_sb_precheck.sh; --precheck-only; _print_report().
+# v3.14: grep '\.tgz$'; mapfile+for em delete_*.
+# v3.13: root_cmd_tty → root_cmd (stderr=2>/dev/null).
+# v3.12: check_bundle_status: root_cmd elimina falso positivo "inprogress".
+# v3.11: _BUNDLE_GREP simplificado; disable_root_ssh: return 0.
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,6 +132,9 @@ touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null |
 BUNDLE_STATUS=""
 BUNDLE_FILES_RECENT=""
 BUNDLE_FILES_OLD=""
+# Data (YYYY-MM-DD) do bundle mais recente de cada categoria
+BUNDLE_DATE_RECENT=""
+BUNDLE_DATE_OLD=""
 
 SB_EXTRA=""
 SB_LOG_AGE=1
@@ -157,6 +159,15 @@ _box_line(){
   local width="$1" char="${2:--}" out=""
   for (( i=0; i<width; i++ )); do out+="${char}"; done
   printf '%s' "${out}"
+}
+
+_epoch_to_date(){
+  # Converte epoch para YYYY-MM-DD de forma portável (Linux + macOS)
+  local ep="$1"
+  if [[ -z "$ep" || "$ep" == "0" ]]; then echo "????-??-??"; return; fi
+  date -d "@${ep}" '+%Y-%m-%d' 2>/dev/null \
+    || date -r "${ep}" '+%Y-%m-%d' 2>/dev/null \
+    || echo "????-??-??"
 }
 
 _is_auth_failed(){
@@ -471,6 +482,8 @@ check_bundle_status(){
   BUNDLE_STATUS="none"
   BUNDLE_FILES_RECENT=""
   BUNDLE_FILES_OLD=""
+  BUNDLE_DATE_RECENT=""
+  BUNDLE_DATE_OLD=""
   local dir="/var/vmware/nsx/file-store"
   local width=74
 
@@ -505,6 +518,10 @@ check_bundle_status(){
   local now_epoch
   now_epoch="$(date +%s)"
 
+  # Epoch do bundle mais recente de cada categoria (para data)
+  local max_epoch_recent=0
+  local max_epoch_old=0
+
   local fname fepoch age fpath
   while IFS= read -r pair; do
     [[ -z "$pair" ]] && continue
@@ -520,13 +537,19 @@ check_bundle_status(){
     log "${ip}: arquivo '${fname}' → ${age} dia(s)."
     if [[ "$age" -le 7 ]]; then
       BUNDLE_FILES_RECENT+="${fpath}"$'\n'
+      [[ "$fepoch" -gt "$max_epoch_recent" ]] && max_epoch_recent="$fepoch"
     else
       BUNDLE_FILES_OLD+="${fpath}"$'\n'
+      [[ "$fepoch" -gt "$max_epoch_old" ]] && max_epoch_old="$fepoch"
     fi
   done <<< "$raw_pairs"
 
   BUNDLE_FILES_RECENT="${BUNDLE_FILES_RECENT%$'\n'}"
   BUNDLE_FILES_OLD="${BUNDLE_FILES_OLD%$'\n'}"
+
+  # Converte epoch para data legível
+  [[ "$max_epoch_recent" -gt 0 ]] && BUNDLE_DATE_RECENT="$(_epoch_to_date "$max_epoch_recent")" || BUNDLE_DATE_RECENT=""
+  [[ "$max_epoch_old"    -gt 0 ]] && BUNDLE_DATE_OLD="$(_epoch_to_date "$max_epoch_old")"       || BUNDLE_DATE_OLD=""
 
   if [[ -n "$BUNDLE_FILES_RECENT" ]]; then
     BUNDLE_STATUS="recent"
@@ -549,7 +572,7 @@ check_bundle_status(){
     fi
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_ok "${ip}: bundle recente presente."
+    log_ok "${ip}: bundle recente presente (${BUNDLE_DATE_RECENT:-??})."
     [[ -n "$BUNDLE_FILES_OLD" ]] && \
       log_warn "${ip}: bundle(s) antigo(s) presentes — use --clean-all para remover."
     return 0
@@ -568,7 +591,7 @@ check_bundle_status(){
     done <<< "$BUNDLE_FILES_OLD"
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_warn "${ip}: todos os bundles são antigos."
+    log_warn "${ip}: todos os bundles são antigos (${BUNDLE_DATE_OLD:-??})."
     return 0
   fi
 
@@ -664,10 +687,17 @@ request_support_bundle(){
 
 # ---------------------------------------------------------------------------
 # _print_report  — tabela final reutilizada por precheck e main
+#
+# Formato de cada linha: "ip|STATUS|AÇÃO|ARQUIVO"
+# STATUS pode ser:
+#   - Data YYYY-MM-DD      → verde  (bundle recente)
+#   - Data YYYY-MM-DD (antigo) → amarelo
+#   - "EM ANDAMENTO"       → ciano
+#   - "AUTH FALHOU"        → vermelho
+#   - "NENHUM"             → ciano
+#   - qualquer outro       → ciano
 # ---------------------------------------------------------------------------
 _print_report(){
-  # Recebe array de linhas no formato "ip|STATUS|AÇÃO|ARQUIVO"
-  # Uso: _print_report "${REPORT_LINES[@]}"
   local width=78
   local title="${1:-RELATÓRIO FINAL — Support Bundle Check}"
   shift || true
@@ -679,7 +709,7 @@ _print_report(){
   printf "${_C_CYAN}╠%s╦%s╦%s╦%s╣${_C_RESET}\n" \
     "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
   printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
-    "NODE" "STATUS" "AÇÃO" "ARQUIVO"
+    "NODE" "DATA BUNDLE" "AÇÃO" "ARQUIVO"
   printf "${_C_CYAN}╠%s╬%s╬%s╬%s╣${_C_RESET}\n" \
     "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
 
@@ -692,10 +722,12 @@ _print_report(){
     if [[ "$r_status" == "AUTH FALHOU" ]]; then
       printf "${_C_RED}║${_C_RESET} %-17s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-18s ${_C_RED}║${_C_RESET}\n" \
         "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-    elif [[ "$r_status" == "RECENTE"* ]]; then
+    elif [[ "$r_status" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      # Data pura → verde (bundle recente ≤7d)
       printf "${_C_GREEN}║${_C_RESET} %-17s ${_C_GREEN}║${_C_RESET} %-16s ${_C_GREEN}║${_C_RESET} %-16s ${_C_GREEN}║${_C_RESET} %-18s ${_C_GREEN}║${_C_RESET}\n" \
         "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-    elif [[ "$r_status" == "ANTIGO"* ]]; then
+    elif [[ "$r_status" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ \(antigo\)$ ]]; then
+      # Data com sufixo (antigo) → amarelo
       printf "${_C_YELLOW}║${_C_RESET} %-17s ${_C_YELLOW}║${_C_RESET} %-16s ${_C_YELLOW}║${_C_RESET} %-16s ${_C_YELLOW}║${_C_RESET} %-18s ${_C_YELLOW}║${_C_RESET}\n" \
         "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
     else
@@ -775,22 +807,19 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_precheck.sh  — v3.15  (NOVO)
+# nsx_sb_precheck.sh  — v3.16
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
 #!/usr/bin/env bash
-# nsx_sb_precheck.sh  — v3.15
+# nsx_sb_precheck.sh  — v3.16
 #
 # Executa APENAS o pre-check em todos os Edge Nodes:
 #   1. Habilita root SSH (admin)
 #   2. Verifica bundles existentes por idade (check_bundle_status)
 #   3. Desabilita root SSH
-#   4. Exibe relatório final com tabela colorida + salva CSV
+#   4. Exibe relatório final: coluna STATUS mostra a data do bundle
 #
 # Nenhuma geração, deleção ou modificação de bundle é realizada.
-#
-# USO:
-#   ./nsx_sb_precheck.sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -800,7 +829,7 @@ need_cmd ssh; need_cmd sshpass
 load_ips; ask_admin_creds; ask_root_creds
 
 STATUS_CSV="${LOG_DIR}/precheck_$(date +%Y%m%d_%H%M%S).csv"
-echo 'ip,bundle_status,recent_count,old_count,files_recent,files_old,timestamp' > "${STATUS_CSV}"
+echo 'ip,bundle_status,bundle_date,recent_count,old_count,files_recent,files_old,timestamp' > "${STATUS_CSV}"
 
 declare -a REPORT_LINES=()
 
@@ -811,7 +840,7 @@ for ip in "${EDGE_IPS[@]}"; do
 
   if ! enable_root_ssh "$ip"; then
     REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
-    printf '%s,auth_failed,0,0,,,%s\n' "$ip" "$(date +%F_%T)" >> "${STATUS_CSV}"
+    printf '%s,auth_failed,,0,0,,,%s\n' "$ip" "$(date +%F_%T)" >> "${STATUS_CSV}"
     continue
   fi
 
@@ -820,29 +849,31 @@ for ip in "${EDGE_IPS[@]}"; do
 
   disable_root_ssh "$ip" || true
 
-  # Contagens para CSV
   local_rec=0; local_old=0
   [[ -n "$BUNDLE_FILES_RECENT" ]] && local_rec="$(echo "$BUNDLE_FILES_RECENT" | grep -c '.' || true)"
   [[ -n "$BUNDLE_FILES_OLD"    ]] && local_old="$(echo "$BUNDLE_FILES_OLD"    | grep -c '.' || true)"
 
-  # Arquivo mais recente para exibição na tabela
   first_recent=""
   [[ -n "$BUNDLE_FILES_RECENT" ]] && first_recent="$(echo "$BUNDLE_FILES_RECENT" | head -1)"
   first_old=""
   [[ -n "$BUNDLE_FILES_OLD" ]]    && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
 
-  # Salva CSV
-  printf '%s,%s,%s,%s,%s,%s,%s\n' \
-    "$ip" "$BUNDLE_STATUS" "$local_rec" "$local_old" \
+  # Data para CSV: recente prevalece; senão antiga
+  csv_date="${BUNDLE_DATE_RECENT:-${BUNDLE_DATE_OLD:-}}"
+
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$ip" "$BUNDLE_STATUS" "$csv_date" "$local_rec" "$local_old" \
     "${first_recent:-}" "${first_old:-}" "$(date +%F_%T)" \
     >> "${STATUS_CSV}"
 
   case "$BUNDLE_STATUS" in
     recent)
-      REPORT_LINES+=("${ip}|RECENTE (≤7d)|OK|${first_recent:-—}")
+      _status="${BUNDLE_DATE_RECENT:-RECENTE}"
+      REPORT_LINES+=("${ip}|${_status}|OK|${first_recent:-—}")
       ;;
     old)
-      REPORT_LINES+=("${ip}|ANTIGO (>7d)|ATENÇÃO|${first_old:-—}")
+      _status="${BUNDLE_DATE_OLD:-ANTIGO} (antigo)"
+      REPORT_LINES+=("${ip}|${_status}|ATENÇÃO|${first_old:-—}")
       ;;
     none)
       REPORT_LINES+=("${ip}|NENHUM|AUSENTE|—")
@@ -856,7 +887,7 @@ for ip in "${EDGE_IPS[@]}"; do
   esac
 done
 
-_print_report "PRE-CHECK — Estado dos Support Bundles" "${REPORT_LINES[@]}"
+_print_report "PRE-CHECK — Data dos Support Bundles" "${REPORT_LINES[@]}"
 
 [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
   log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]} — verifique credenciais manualmente."
@@ -870,11 +901,11 @@ PRECHECK
 chmod +x "${AUTO_DIR}/nsx_sb_precheck.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.15
+# nsx_sb_main.sh  — v3.16
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.15
+# nsx_sb_main.sh  — v3.16
 #
 # FLAGS:
 #   (nenhuma)        Fluxo completo: pre-check + geração de bundle
@@ -906,7 +937,7 @@ declare -a REPORT_LINES=()
 declare -A NODE_ACAO=()
 
 # ---------------------------------------------------------------------------
-# Modo --precheck-only: apenas verificação, sem geração nem deleção
+# Modo --precheck-only
 # ---------------------------------------------------------------------------
 if [[ "$PRECHECK_ONLY" == true ]]; then
   log_banner "PRE-CHECK ONLY — Verificando bundles (sem geração)"
@@ -934,15 +965,21 @@ if [[ "$PRECHECK_ONLY" == true ]]; then
     [[ -n "$BUNDLE_FILES_OLD" ]]    && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
 
     case "$BUNDLE_STATUS" in
-      recent)     REPORT_LINES+=("${ip}|RECENTE (≤7d)|OK|${first_recent:-—}")     ;;
-      old)        REPORT_LINES+=("${ip}|ANTIGO (>7d)|ATENÇÃO|${first_old:-—}")    ;;
-      none)       REPORT_LINES+=("${ip}|NENHUM|AUSENTE|—")                         ;;
-      inprogress) REPORT_LINES+=("${ip}|EM ANDAMENTO|AGUARDAR|—")                  ;;
-      *)          REPORT_LINES+=("${ip}|DESCONHECIDO|VERIFICAR|—")                 ;;
+      recent)
+        _status="${BUNDLE_DATE_RECENT:-RECENTE}"
+        REPORT_LINES+=("${ip}|${_status}|OK|${first_recent:-—}")
+        ;;
+      old)
+        _status="${BUNDLE_DATE_OLD:-ANTIGO} (antigo)"
+        REPORT_LINES+=("${ip}|${_status}|ATENÇÃO|${first_old:-—}")
+        ;;
+      none)       REPORT_LINES+=("${ip}|NENHUM|AUSENTE|—")        ;;
+      inprogress) REPORT_LINES+=("${ip}|EM ANDAMENTO|AGUARDAR|—") ;;
+      *)          REPORT_LINES+=("${ip}|DESCONHECIDO|VERIFICAR|—") ;;
     esac
   done
 
-  _print_report "PRE-CHECK — Estado dos Support Bundles" "${REPORT_LINES[@]}"
+  _print_report "PRE-CHECK — Data dos Support Bundles" "${REPORT_LINES[@]}"
 
   [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
     log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]}"
@@ -952,7 +989,7 @@ if [[ "$PRECHECK_ONLY" == true ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Fluxo completo (com ou sem --clean-all)
+# Fluxo completo
 # ---------------------------------------------------------------------------
 ask_bundle_options
 
@@ -991,16 +1028,23 @@ for ip in "${EDGE_IPS[@]}"; do
   printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" \
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 
+  first_recent=""
+  [[ -n "$BUNDLE_FILES_RECENT" ]] && first_recent="$(echo "$BUNDLE_FILES_RECENT" | head -1)"
+  first_old=""
+  [[ -n "$BUNDLE_FILES_OLD" ]] && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
+
   case "$BUNDLE_STATUS" in
     recent)
-      REPORT_LINES+=("${ip}|RECENTE (≤7d)|PULADO|${BUNDLE_FILES_RECENT}")
+      _status="${BUNDLE_DATE_RECENT:-RECENTE}"
+      REPORT_LINES+=("${ip}|${_status}|PULADO|${first_recent:-—}")
       NODE_ACAO[$ip]="PULADO"
       ;;
     old)
+      _status="${BUNDLE_DATE_OLD:-ANTIGO} (antigo)"
       delete_old_bundles "$ip"
       printf '%s,precheck,deleted_old,ok,%s\n' "$ip" "$(date +%F_%T)" \
         | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      REPORT_LINES+=("${ip}|ANTIGO (>7d)|DEL+GERANDO|${BUNDLE_FILES_OLD}")
+      REPORT_LINES+=("${ip}|${_status}|DEL+GERANDO|${first_old:-—}")
       NODE_ACAO[$ip]="GERANDO"
       ;;
     none)
@@ -1127,7 +1171,7 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.15
+# NSX Edge Automation — Manual de Uso  v3.16
 
 ## Scripts disponíveis
 
@@ -1159,25 +1203,36 @@ cd ~/nsx-edge-automation/automations/support_bundle
 ./nsx_sb_main.sh --clean-all
 ```
 
-## Relatório do pre-check
+## Relatório do pre-check (v3.16)
 
-Ao final do pre-check, é exibida uma tabela colorida:
+A coluna **DATA BUNDLE** exibe a data real (`YYYY-MM-DD`) do arquivo mais recente encontrado:
 
-| Cor | Status | Significado |
+| Cor | Valor em DATA BUNDLE | Significado |
 |---|---|---|
-| Verde | `RECENTE (≤7d)` | Bundle presente e recente — nenhuma ação necessária |
-| Amarelo | `ANTIGO (>7d)` | Bundle existente mas expirado — recomenda limpeza |
+| Verde | `2026-05-12` | Bundle recente (≤7d) — nenhuma ação necessária |
+| Amarelo | `2026-04-30 (antigo)` | Bundle expirado (>7d) — recomenda limpeza |
 | Ciano | `NENHUM` | Nenhum bundle encontrado — será gerado no fluxo completo |
 | Ciano | `EM ANDAMENTO` | Geração em curso — aguardar conclusão |
 | Vermelho | `AUTH FALHOU` | Credenciais admin inválidas — verificar manualmente |
 
-O relatório também é salvo em CSV em `logs/precheck_YYYYMMDD_HHMMSS.csv`.
+O relatório também é salvo em CSV em `logs/precheck_YYYYMMDD_HHMMSS.csv`
+com coluna `bundle_date`.
+
+## Correções v3.16
+
+- `check_bundle_status()`: exporta `BUNDLE_DATE_RECENT` e `BUNDLE_DATE_OLD`
+  (data `YYYY-MM-DD` derivada do `fepoch`/`stat` do bundle mais recente).
+- `_print_report()`: cabeçalho da coluna renomeado para **DATA BUNDLE**;
+  detecção de cor por regex `^[0-9]{4}-[0-9]{2}-[0-9]{2}` (verde = recente,
+  `(antigo)` = amarelo).
+- `nsx_sb_precheck.sh` e `nsx_sb_main.sh`: STATUS passa a ser a data real
+  em vez de `RECENTE (≤7d)` / `ANTIGO (>7d)`.
 
 ## Correções v3.15
 
 - Novo `nsx_sb_precheck.sh` — script dedicado de pre-check.
 - `nsx_sb_main.sh --precheck-only` — flag equivalente inline.
-- `_print_report()` em `common.sh` — função reutilizável de tabela colorida, com linha colorida por status (verde/amarelo/vermelho/ciano).
+- `_print_report()` em `common.sh` — função reutilizável de tabela colorida.
 
 ## Correções v3.14
 
@@ -1210,13 +1265,12 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.15"
+echo "  Deploy concluído! v3.16"
 echo "================================================================"
 echo ""
-echo "  Novidades v3.15:"
-echo "    nsx_sb_precheck.sh     — pre-check dedicado com relatório"
-echo "    nsx_sb_main.sh         — nova flag --precheck-only"
-echo "    common.sh _print_report — tabela colorida reutilizável"
+echo "  Novidade v3.16:"
+echo "    STATUS na tabela exibe a data real do bundle (YYYY-MM-DD)"
+echo "    em vez de 'RECENTE (≤7d)' / 'ANTIGO (>7d)'"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./nsx_sb_precheck.sh"
