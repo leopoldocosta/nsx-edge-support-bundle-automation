@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.9
+# nsx_sb_main.sh  — v3.10
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -11,15 +11,17 @@ load_ips; ask_admin_creds; ask_root_creds
 CLEAN_ALL=false
 [[ "${1:-}" == "--clean-all" ]] && CLEAN_ALL=true
 
+# ---------------------------------------------------------------------------
+# MENU: opções do support-bundle (timeout 10s → padrão automático)
+# ---------------------------------------------------------------------------
+ask_bundle_options
+
 RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
 STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
 declare -a REPORT_LINES=()
 # FIX v3.9 — array associativo para decisão de ação na PHASE 1.
-# Elimina bug onde BUNDLE_FILES_RECENT com múltiplas linhas quebrava
-# o parsing de string com pipe no REPORT_LINES, fazendo local_acao ficar
-# vazio e o bundle ser gerado mesmo quando deveria ser pulado.
 declare -A NODE_ACAO=()
 
 if [[ "$CLEAN_ALL" == true ]]; then
@@ -81,6 +83,7 @@ for ip in "${EDGE_IPS[@]}"; do
 done
 
 log_banner "PHASE 1: Support Bundle Request (background)"
+log "Opções do bundle: get support-bundle file <nome>${SB_EXTRA:+ ${SB_EXTRA}} log-age ${SB_LOG_AGE}"
 
 for ip in "${EDGE_IPS[@]}"; do
   if _node_auth_failed "$ip"; then
@@ -88,13 +91,12 @@ for ip in "${EDGE_IPS[@]}"; do
     continue
   fi
 
-  # FIX v3.9 — usa array associativo em vez de parsing de string com pipe
   if [[ "${NODE_ACAO[$ip]:-}" == "PULADO" ]]; then
     log "${ip}: pulando solicitação de bundle."
     continue
   fi
 
-  request_support_bundle "$ip"
+  request_support_bundle "$ip" "${SB_EXTRA:-}" "${SB_LOG_AGE:-1}"
   printf '%s,phase1,sb_requested_bg,ok,%s\n' "$ip" "$(date +%F_%T)" \
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
