@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# lib/common.sh  — v3.10
+# lib/common.sh  — v3.11
 #
-# NOVO v3.10:
-#   ask_bundle_options() — menu interativo com timeout 10s:
-#     [1] Padrão / [2] all / [3] all remove-core-file  +  log-age 1..30
-#     Timeout 10s sem resposta → padrão automático (sem extra, log-age 1)
-#     Exporta SB_EXTRA e SB_LOG_AGE para uso em request_support_bundle().
-#   request_support_bundle() — aceita sb_extra e sb_log_age como parâmetros.
+# FIX v3.11:
+#   _list_bundles() e _list_bundles_with_age(): grep remoto simplificado
+#   para '\.tgz$'. O padrão ERE complexo com alternativas (^support[-_]bundle|
+#   ^sb_).*\.tgz$|\.tgz$ falhava silenciosamente no shell restrito do NSX
+#   Edge, causando que 'support-bundle_nsx-edge-XX.tgz' não fosse listado
+#   e portanto não deletado no --clean-all.
+#
+# Herdado v3.10:
+#   ask_bundle_options() — menu interativo com timeout 10s
+#   request_support_bundle() — aceita sb_extra e sb_log_age como parâmetros
 #
 # Herdado v3.9:
-#   NODE_ACAO[] — array associativo elimina bug de geração indesejada
-#     com 2+ bundles recentes (parsing de REPORT_LINES com pipe falhava).
+#   NODE_ACAO[] — array associativo
 #
 # Herdado v3.8:
-#   _list_bundles_with_age() — UMA chamada SSH retorna "NOME EPOCH" por bundle.
-#   Idade calculada localmente — sem age=999 em bundles novos.
+#   _list_bundles_with_age() — UMA chamada SSH retorna "NOME EPOCH" por bundle
 #
 # Herdado v3.7:
-#   _BUNDLE_PROC_GREP preciso: gen_support_bundle|support_bundles/__self__.py
-#   LogLevel=ERROR em ssh_admin/ssh_root
-#   enable_root_ssh detecta Permission denied → NODE_AUTH_FAILED[]
+#   _BUNDLE_PROC_GREP preciso, LogLevel=ERROR, NODE_AUTH_FAILED[]
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,7 +63,12 @@ export SB_EXTRA SB_LOG_AGE
 # Array global de nodes com falha de autenticação admin
 declare -a NODE_AUTH_FAILED=()
 
-_BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
+# ---------------------------------------------------------------------------
+# FIX v3.11 — padrão simplificado para grep REMOTO no shell do NSX Edge.
+# O shell restrito do NSX não lida bem com alternativas ERE complexas em
+# pipe. '\.tgz$' captura todos os bundles (.tgz) sem ambiguidade.
+# ---------------------------------------------------------------------------
+_BUNDLE_GREP='\.tgz$'
 _BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
 
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
@@ -89,17 +94,6 @@ _is_auth_failed(){
 
 # ---------------------------------------------------------------------------
 # ask_bundle_options
-#
-#   Exibe menu interativo com timeout de 10 segundos por pergunta.
-#   Sem resposta → padrão automático: SB_EXTRA=""  SB_LOG_AGE=1
-#
-#   Opções de modo:
-#     [1] Padrão          → sem extra          (padrão)
-#     [2] all             → all
-#     [3] all remove-core → all remove-core-file
-#
-#   Em seguida pergunta log-age (1..30), também com timeout 10s.
-#   Ao final exibe box de confirmação com o comando que será usado.
 # ---------------------------------------------------------------------------
 ask_bundle_options(){
   local width=74
@@ -117,7 +111,6 @@ ask_bundle_options(){
   printf "${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
   echo ""
 
-  # --- Pergunta modo (timeout 10s) ---
   local _t
   for _t in 10 9 8 7 6 5 4 3 2 1; do
     printf "\r${_C_BLUE_BOLD}Modo [1/2/3, Enter=padrão] (%2ds): ${_C_RESET}" "$_t"
@@ -134,7 +127,6 @@ ask_bundle_options(){
     *) SB_EXTRA=""                     ;;
   esac
 
-  # --- Pergunta log-age (timeout 10s) ---
   _age=""
   for _t in 10 9 8 7 6 5 4 3 2 1; do
     printf "\r${_C_BLUE_BOLD}log-age [1..30, Enter=1] (%2ds): ${_C_RESET}" "$_t"
@@ -145,7 +137,6 @@ ask_bundle_options(){
   done
   echo ""
 
-  # Valida: aceita apenas inteiro 1..30; fora do range → 1
   if [[ "${_age:-}" =~ ^[0-9]+$ ]] && (( _age >= 1 && _age <= 30 )); then
     SB_LOG_AGE="$_age"
   else
@@ -154,7 +145,6 @@ ask_bundle_options(){
 
   export SB_EXTRA SB_LOG_AGE
 
-  # Monta preview do comando para exibição (sem += que pode ser interpretado como cmd)
   local _cmd_preview="get support-bundle file <nome>"
   if [[ -n "$SB_EXTRA" ]]; then
     _cmd_preview="${_cmd_preview} ${SB_EXTRA}"
@@ -336,6 +326,7 @@ disable_root_ssh(){
     return 0
   fi
   [[ -n "$out" ]] && log "${ip}: [clear ssh root-login] ${out}"
+  return 0
 }
 
 check_bundle_log(){
@@ -395,19 +386,30 @@ _bundle_age_days(){
   echo "$age"
 }
 
+# ---------------------------------------------------------------------------
+# _list_bundles IP
+#
+#   FIX v3.11: grep remoto simplificado para '\.tgz$'.
+#   O padrão ERE complexo anterior falhava silenciosamente no shell do NSX.
+# ---------------------------------------------------------------------------
 _list_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
-  root_cmd_tty "$ip" "ls -1 ${dir}/ 2>/dev/null | grep -E '${_BUNDLE_GREP}' || true"
+  root_cmd_tty "$ip" "ls -1 '${dir}/' 2>/dev/null | grep '\.tgz$' || true"
 }
 
+# ---------------------------------------------------------------------------
+# _list_bundles_with_age IP
+#
+#   FIX v3.11: grep remoto simplificado para '\.tgz$'.
+#   Uma única chamada SSH retorna "NOME EPOCH" para todos os .tgz.
+# ---------------------------------------------------------------------------
 _list_bundles_with_age(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
-  local bundle_grep="${_BUNDLE_GREP}"
   root_cmd_tty "$ip" \
     "cd '${dir}' 2>/dev/null && \
-     for f in \$(ls -1 2>/dev/null | grep -E '${bundle_grep}' || true); do \
+     for f in \$(ls -1 2>/dev/null | grep '\.tgz\$' || true); do \
        ep=\$(stat -c '%Y' \"\$f\" 2>/dev/null || echo 0); \
        echo \"\$f \$ep\"; \
      done"
@@ -566,10 +568,6 @@ delete_all_bundles(){
 
 # ---------------------------------------------------------------------------
 # request_support_bundle IP [sb_extra] [sb_log_age]
-#
-#   v3.10: aceita parâmetros opcionais sb_extra e sb_log_age.
-#   Constrói o comando final na forma:
-#     get support-bundle file <nome> [all] [remove-core-file] log-age <N>
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
@@ -579,7 +577,6 @@ request_support_bundle(){
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
   local logfile="${LOG_DIR}/sb_bg_${ip//./_}_$(date +%Y%m%d_%H%M%S).log"
 
-  # Monta o comando — sem += para evitar interpretação como comando pelo shell
   local nsx_cmd="get support-bundle file ${fname}"
   if [[ -n "$sb_extra" ]]; then
     nsx_cmd="${nsx_cmd} ${sb_extra}"
