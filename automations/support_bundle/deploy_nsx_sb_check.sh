@@ -1,47 +1,29 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.14
+# deploy_nsx_sb_check.sh  v3.15
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
 #   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 #
+# CHANGELOG v3.15:
+#   - Novo script nsx_sb_precheck.sh:
+#     Executa APENAS o pre-check em todos os Edge Nodes (habilita root
+#     SSH, verifica bundles por idade, desabilita root SSH) e exibe
+#     relatório final com tabela + CSV. Nenhuma geração ou deleção de
+#     bundle é realizada. Útil para auditar o estado dos nodes antes de
+#     decidir se é necessário rodar o fluxo completo.
+#
+#   - nsx_sb_main.sh: nova flag --precheck-only.
+#     Executa somente a fase de pre-check e exibe o relatório, sem
+#     disparar ask_bundle_options nem request_support_bundle.
+#     Equivalente a rodar nsx_sb_precheck.sh diretamente.
+#
 # CHANGELOG v3.14:
-#   - _list_bundles(): grep ampliado de '^sb_.*\.tgz$' → '\.tgz$'.
-#     Arquivos com prefixo 'support-bundle-*' eram invisíveis para
-#     delete_all_bundles() e também para check_bundle_status(), que
-#     via 3 arquivos no ls -lh mas contava apenas 1 no loop de deleção.
-#
-#   - delete_all_bundles(): substituição de
-#       while IFS= read -r f; do ... done <<< "$all_files"
-#     por
-#       mapfile -t _del_files <<< "$all_files"; for f in "${_del_files[@]}"
-#     Com set -euo pipefail, o while abortava silenciosamente após a
-#     primeira iteração quando root_cmd retornava rc não-zero internamente,
-#     deletando apenas o primeiro arquivo e declarando "limpeza concluída".
-#
-#   - delete_old_bundles(): mesma correção mapfile aplicada ao loop
-#     que itera sobre BUNDLE_FILES_OLD (caminhos completos).
-#
-#   - _list_bundles_with_age(): grep ampliado de '^sb_.*\.tgz ' → '\.tgz '
-#     para consistência — check_bundle_status() também passa a enxergar
-#     arquivos support-bundle-* ao calcular idade/recência.
-#
-# CHANGELOG v3.13:
-#   - _list_bundles(), _list_bundles_with_age(), delete_all_bundles() e
-#     delete_old_bundles(): substituição de root_cmd_tty → root_cmd (stderr
-#     descartado via 2>/dev/null) + filtro LOCAL grep '^sb_.*\.tgz$'.
-#     Elimina contaminação do stdout pelo warning SSH do cliente local.
-#
-# CHANGELOG v3.12:
-#   - check_bundle_status: detecção de processo usa root_cmd (stderr descartado)
-#     em vez de root_cmd_tty (stderr misturado ao stdout).
-#
-# CHANGELOG v3.11:
-#   - _BUNDLE_GREP simplificado para '\.tgz$'
-#   - _cmd_preview / nsx_cmd: substituído += por if/then
-#   - disable_root_ssh: return 0 explícito ao final
+#   - _list_bundles(): grep '\\.tgz$' — captura support-bundle-*
+#   - _list_bundles_with_age(): grep '\\.tgz ' — consistência
+#   - delete_all_bundles() e delete_old_bundles(): mapfile + for
 # =============================================================================
 set -euo pipefail
 
@@ -59,7 +41,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.14"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.15"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -73,6 +55,7 @@ Estrutura que será criada:
   │   └── support_bundle/
   │       ├── edge_nodes.txt
   │       ├── nsx_sb_main.sh
+  │       ├── nsx_sb_precheck.sh
   │       ├── test_connections.sh
   │       ├── admin_exec.sh
   │       ├── root_exec.sh
@@ -94,38 +77,28 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.14
+# lib/common.sh  — v3.15 (sem alterações funcionais em relação à v3.14)
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.14
+# lib/common.sh  — v3.15
+#
+# Sem alterações funcionais em relação à v3.14.
+# Versão incrementada para acompanhar o kit.
 #
 # FIX v3.14:
 #   _list_bundles(): grep '\.tgz$' (era '^sb_.*\.tgz$').
-#     Arquivos 'support-bundle-*' eram invisíveis → ignorados no --clean-all.
-#
-#   _list_bundles_with_age(): grep '\.tgz ' (era '^sb_.*\.tgz ').
-#     Consistência com _list_bundles(); check_bundle_status() passa a
-#     enxergar e classificar arquivos support-bundle-* por idade.
-#
-#   delete_all_bundles(): while read → mapfile + for.
-#     Com set -euo pipefail o while abortava após a 1ª iteração,
-#     deletando apenas o primeiro arquivo.
-#
-#   delete_old_bundles(): mesma correção mapfile para BUNDLE_FILES_OLD.
+#   _list_bundles_with_age(): grep '\.tgz ' — consistência.
+#   delete_all_bundles() e delete_old_bundles(): mapfile + for.
 #
 # FIX v3.13:
-#   root_cmd_tty → root_cmd (stderr=2>/dev/null) em _list_bundles,
-#   _list_bundles_with_age, delete_all_bundles, delete_old_bundles.
-#   Elimina contaminação do stdout pelo warning SSH do cliente local.
+#   root_cmd_tty → root_cmd (stderr=2>/dev/null).
 #
 # FIX v3.12:
-#   check_bundle_status: root_cmd (stderr=2>/dev/null) elimina falso
-#   positivo "bundle em andamento".
+#   check_bundle_status: root_cmd elimina falso positivo "inprogress".
 #
 # FIX v3.11:
-#   _BUNDLE_GREP simplificado; _cmd_preview / nsx_cmd: += → if/then;
-#   disable_root_ssh: return 0 explícito.
+#   _BUNDLE_GREP simplificado; += → if/then; disable_root_ssh: return 0.
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -473,7 +446,6 @@ list_bundle_dir(){
   echo ""
 }
 
-# v3.14: grep '\.tgz$' — captura qualquer .tgz (inclusive support-bundle-*)
 _list_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -481,7 +453,6 @@ _list_bundles(){
     | grep '\.tgz$' || true
 }
 
-# v3.14: grep '\.tgz ' — consistência com _list_bundles
 _list_bundles_with_age(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -523,7 +494,7 @@ check_bundle_status(){
   log "${ip}: [bundles detectados] resultado bruto: '${all_bundles:-<vazio>}'"
 
   if [[ -z "$all_bundles" ]]; then
-    log "${ip}: nenhum bundle encontrado em file-store — será gerado."
+    log "${ip}: nenhum bundle encontrado em file-store."
     return 0
   fi
 
@@ -578,7 +549,7 @@ check_bundle_status(){
     fi
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_ok "${ip}: bundle recente presente — geração será pulada."
+    log_ok "${ip}: bundle recente presente."
     [[ -n "$BUNDLE_FILES_OLD" ]] && \
       log_warn "${ip}: bundle(s) antigo(s) presentes — use --clean-all para remover."
     return 0
@@ -588,7 +559,7 @@ check_bundle_status(){
     BUNDLE_STATUS="old"
     local old_count
     old_count="$(echo "$BUNDLE_FILES_OLD" | grep -c '.' || true)"
-    local title=" ${ip}: ${old_count} bundle(s) ANTIGO(S) >7d — serão deletados "
+    local title=" ${ip}: ${old_count} bundle(s) ANTIGO(S) >7d "
     echo ""
     printf "  ${_C_BOX_YELLOW_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     while IFS= read -r fline; do
@@ -597,15 +568,14 @@ check_bundle_status(){
     done <<< "$BUNDLE_FILES_OLD"
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_warn "${ip}: todos os bundles são antigos — serão deletados e novo será gerado."
+    log_warn "${ip}: todos os bundles são antigos."
     return 0
   fi
 
-  log "${ip}: nenhum bundle encontrado — será gerado."
+  log "${ip}: nenhum bundle encontrado."
   return 0
 }
 
-# v3.14: mapfile + for — elimina abort precoce do while com set -euo pipefail
 delete_old_bundles(){
   local ip="$1"
   [[ -z "$BUNDLE_FILES_OLD" ]] && return 0
@@ -624,7 +594,6 @@ delete_old_bundles(){
   done
 }
 
-# v3.14: grep '\.tgz$' em _list_bundles + mapfile + for
 delete_all_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -654,9 +623,6 @@ delete_all_bundles(){
   log_ok "${ip}: limpeza total concluída."
 }
 
-# ---------------------------------------------------------------------------
-# request_support_bundle IP [SB_EXTRA] [SB_LOG_AGE]
-# ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
   local sb_extra="${2:-${SB_EXTRA:-}}"
@@ -694,6 +660,53 @@ request_support_bundle(){
 
   log_ok "${ip}: solicitação disparada em background."
   log "${ip}: acompanhe com: tail -f ${logfile}"
+}
+
+# ---------------------------------------------------------------------------
+# _print_report  — tabela final reutilizada por precheck e main
+# ---------------------------------------------------------------------------
+_print_report(){
+  # Recebe array de linhas no formato "ip|STATUS|AÇÃO|ARQUIVO"
+  # Uso: _print_report "${REPORT_LINES[@]}"
+  local width=78
+  local title="${1:-RELATÓRIO FINAL — Support Bundle Check}"
+  shift || true
+  local -a lines=("$@")
+
+  echo ""
+  printf "${_C_CYAN}╔%s╗${_C_RESET}\n" "$(_box_line $(( width - 2 )) '═')"
+  printf "${_C_CYAN}║  %-*s║${_C_RESET}\n" "$(( width - 3 ))" "  ${title}  —  $(date '+%F %T')"
+  printf "${_C_CYAN}╠%s╦%s╦%s╦%s╣${_C_RESET}\n" \
+    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
+  printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
+    "NODE" "STATUS" "AÇÃO" "ARQUIVO"
+  printf "${_C_CYAN}╠%s╬%s╬%s╬%s╣${_C_RESET}\n" \
+    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
+
+  local entry
+  for entry in "${lines[@]}"; do
+    IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
+    local r_arq_short
+    r_arq_short="$(basename "${r_arquivo%%$'\n'*}" 2>/dev/null || echo "${r_arquivo}")"
+    [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
+    if [[ "$r_status" == "AUTH FALHOU" ]]; then
+      printf "${_C_RED}║${_C_RESET} %-17s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-18s ${_C_RED}║${_C_RESET}\n" \
+        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+    elif [[ "$r_status" == "RECENTE"* ]]; then
+      printf "${_C_GREEN}║${_C_RESET} %-17s ${_C_GREEN}║${_C_RESET} %-16s ${_C_GREEN}║${_C_RESET} %-16s ${_C_GREEN}║${_C_RESET} %-18s ${_C_GREEN}║${_C_RESET}\n" \
+        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+    elif [[ "$r_status" == "ANTIGO"* ]]; then
+      printf "${_C_YELLOW}║${_C_RESET} %-17s ${_C_YELLOW}║${_C_RESET} %-16s ${_C_YELLOW}║${_C_RESET} %-16s ${_C_YELLOW}║${_C_RESET} %-18s ${_C_YELLOW}║${_C_RESET}\n" \
+        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+    else
+      printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
+        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+    fi
+  done
+
+  printf "${_C_CYAN}╚%s╩%s╩%s╩%s╝${_C_RESET}\n" \
+    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
+  echo ""
 }
 COMMON
 chmod +x "${LIB_DIR}/common.sh"
@@ -762,11 +775,111 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.14
+# nsx_sb_precheck.sh  — v3.15  (NOVO)
+# ---------------------------------------------------------------------------
+cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
+#!/usr/bin/env bash
+# nsx_sb_precheck.sh  — v3.15
+#
+# Executa APENAS o pre-check em todos os Edge Nodes:
+#   1. Habilita root SSH (admin)
+#   2. Verifica bundles existentes por idade (check_bundle_status)
+#   3. Desabilita root SSH
+#   4. Exibe relatório final com tabela colorida + salva CSV
+#
+# Nenhuma geração, deleção ou modificação de bundle é realizada.
+#
+# USO:
+#   ./nsx_sb_precheck.sh
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export AUTO_DIR="${SCRIPT_DIR}"
+source "${SCRIPT_DIR}/../../lib/common.sh"
+
+need_cmd ssh; need_cmd sshpass
+load_ips; ask_admin_creds; ask_root_creds
+
+STATUS_CSV="${LOG_DIR}/precheck_$(date +%Y%m%d_%H%M%S).csv"
+echo 'ip,bundle_status,recent_count,old_count,files_recent,files_old,timestamp' > "${STATUS_CSV}"
+
+declare -a REPORT_LINES=()
+
+log_banner "PRE-CHECK ONLY — Verificando bundles em todos os Edge Nodes"
+
+for ip in "${EDGE_IPS[@]}"; do
+  log "${ip}: iniciando pre-check..."
+
+  if ! enable_root_ssh "$ip"; then
+    REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
+    printf '%s,auth_failed,0,0,,,%s\n' "$ip" "$(date +%F_%T)" >> "${STATUS_CSV}"
+    continue
+  fi
+
+  check_bundle_log "$ip" || true
+  check_bundle_status "$ip"
+
+  disable_root_ssh "$ip" || true
+
+  # Contagens para CSV
+  local_rec=0; local_old=0
+  [[ -n "$BUNDLE_FILES_RECENT" ]] && local_rec="$(echo "$BUNDLE_FILES_RECENT" | grep -c '.' || true)"
+  [[ -n "$BUNDLE_FILES_OLD"    ]] && local_old="$(echo "$BUNDLE_FILES_OLD"    | grep -c '.' || true)"
+
+  # Arquivo mais recente para exibição na tabela
+  first_recent=""
+  [[ -n "$BUNDLE_FILES_RECENT" ]] && first_recent="$(echo "$BUNDLE_FILES_RECENT" | head -1)"
+  first_old=""
+  [[ -n "$BUNDLE_FILES_OLD" ]]    && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
+
+  # Salva CSV
+  printf '%s,%s,%s,%s,%s,%s,%s\n' \
+    "$ip" "$BUNDLE_STATUS" "$local_rec" "$local_old" \
+    "${first_recent:-}" "${first_old:-}" "$(date +%F_%T)" \
+    >> "${STATUS_CSV}"
+
+  case "$BUNDLE_STATUS" in
+    recent)
+      REPORT_LINES+=("${ip}|RECENTE (≤7d)|OK|${first_recent:-—}")
+      ;;
+    old)
+      REPORT_LINES+=("${ip}|ANTIGO (>7d)|ATENÇÃO|${first_old:-—}")
+      ;;
+    none)
+      REPORT_LINES+=("${ip}|NENHUM|AUSENTE|—")
+      ;;
+    inprogress)
+      REPORT_LINES+=("${ip}|EM ANDAMENTO|AGUARDAR|—")
+      ;;
+    *)
+      REPORT_LINES+=("${ip}|DESCONHECIDO|VERIFICAR|—")
+      ;;
+  esac
+done
+
+_print_report "PRE-CHECK — Estado dos Support Bundles" "${REPORT_LINES[@]}"
+
+[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
+  log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]} — verifique credenciais manualmente."
+
+log_ok "Pre-check concluído. CSV: ${STATUS_CSV}"
+log "Para gerar bundles: ./nsx_sb_main.sh"
+log "Para limpar todos:  ./nsx_sb_main.sh --clean-all"
+
+prompt_clear_creds
+PRECHECK
+chmod +x "${AUTO_DIR}/nsx_sb_precheck.sh"
+
+# ---------------------------------------------------------------------------
+# nsx_sb_main.sh  — v3.15
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.14
+# nsx_sb_main.sh  — v3.15
+#
+# FLAGS:
+#   (nenhuma)        Fluxo completo: pre-check + geração de bundle
+#   --clean-all      Apaga todos os bundles antes do fluxo completo
+#   --precheck-only  Executa apenas o pre-check e exibe relatório (sem gerar bundles)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -776,16 +889,72 @@ need_cmd ssh; need_cmd sshpass
 load_ips; ask_admin_creds; ask_root_creds
 
 CLEAN_ALL=false
-[[ "${1:-}" == "--clean-all" ]] && CLEAN_ALL=true
+PRECHECK_ONLY=false
 
-ask_bundle_options
+for _arg in "${@:-}"; do
+  case "${_arg}" in
+    --clean-all)     CLEAN_ALL=true     ;;
+    --precheck-only) PRECHECK_ONLY=true ;;
+  esac
+done
 
 RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
 STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
-echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
+echo 'ip,phase,status,details,timestamp' > "${STATUS_CSV}"
 
 declare -a REPORT_LINES=()
 declare -A NODE_ACAO=()
+
+# ---------------------------------------------------------------------------
+# Modo --precheck-only: apenas verificação, sem geração nem deleção
+# ---------------------------------------------------------------------------
+if [[ "$PRECHECK_ONLY" == true ]]; then
+  log_banner "PRE-CHECK ONLY — Verificando bundles (sem geração)"
+
+  for ip in "${EDGE_IPS[@]}"; do
+    log "${ip}: iniciando pre-check..."
+
+    if ! enable_root_ssh "$ip"; then
+      REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
+      printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
+        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      continue
+    fi
+
+    check_bundle_log "$ip" || true
+    check_bundle_status "$ip"
+    disable_root_ssh "$ip" || true
+
+    printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" \
+      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+
+    first_recent=""
+    [[ -n "$BUNDLE_FILES_RECENT" ]] && first_recent="$(echo "$BUNDLE_FILES_RECENT" | head -1)"
+    first_old=""
+    [[ -n "$BUNDLE_FILES_OLD" ]]    && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
+
+    case "$BUNDLE_STATUS" in
+      recent)     REPORT_LINES+=("${ip}|RECENTE (≤7d)|OK|${first_recent:-—}")     ;;
+      old)        REPORT_LINES+=("${ip}|ANTIGO (>7d)|ATENÇÃO|${first_old:-—}")    ;;
+      none)       REPORT_LINES+=("${ip}|NENHUM|AUSENTE|—")                         ;;
+      inprogress) REPORT_LINES+=("${ip}|EM ANDAMENTO|AGUARDAR|—")                  ;;
+      *)          REPORT_LINES+=("${ip}|DESCONHECIDO|VERIFICAR|—")                 ;;
+    esac
+  done
+
+  _print_report "PRE-CHECK — Estado dos Support Bundles" "${REPORT_LINES[@]}"
+
+  [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
+    log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]}"
+  log_ok "Status CSV: ${STATUS_CSV}"
+  prompt_clear_creds
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Fluxo completo (com ou sem --clean-all)
+# ---------------------------------------------------------------------------
+ask_bundle_options
 
 if [[ "$CLEAN_ALL" == true ]]; then
   log_banner "CLEAN-ALL: Apagando TODOS os bundles existentes"
@@ -846,19 +1015,14 @@ for ip in "${EDGE_IPS[@]}"; do
 done
 
 log_banner "PHASE 1: Support Bundle Request (background)"
-log "Opções do bundle: get support-bundle file <nome>${SB_EXTRA:+ ${SB_EXTRA}} log-age ${SB_LOG_AGE}"
+log "Opções: get support-bundle file <nome>${SB_EXTRA:+ ${SB_EXTRA}} log-age ${SB_LOG_AGE}"
 
 for ip in "${EDGE_IPS[@]}"; do
-  if _node_auth_failed "$ip"; then
-    log "${ip}: pulando (falha de autenticação admin)."
-    continue
-  fi
-
+  _node_auth_failed "$ip" && continue
   if [[ "${NODE_ACAO[$ip]:-}" == "PULADO" ]]; then
     log "${ip}: pulando solicitação de bundle."
     continue
   fi
-
   request_support_bundle "$ip" "${SB_EXTRA:-}" "${SB_LOG_AGE:-1}"
   printf '%s,phase1,sb_requested_bg,ok,%s\n' "$ip" "$(date +%F_%T)" \
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
@@ -874,26 +1038,8 @@ for ip in "${EDGE_IPS[@]}"; do
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-echo ""
-printf "${_C_CYAN}╔══════════════════════════════════════════════════════════════════════════════╗${_C_RESET}\n"
-printf "${_C_CYAN}║  RELATÓRIO FINAL — Support Bundle Check  %-35s║${_C_RESET}\n" "$(date '+%F %T')"
-printf "${_C_CYAN}╠═══════════════════╦══════════════════╦══════════════════╦════════════════════╣${_C_RESET}\n"
-printf "${_C_CYAN}║ %-17s ║ %-16s ║ %-16s ║ %-18s ║${_C_RESET}\n" "NODE" "STATUS" "AÇÃO" "ARQUIVO"
-printf "${_C_CYAN}╠═══════════════════╬══════════════════╬══════════════════╬════════════════════╣${_C_RESET}\n"
-for entry in "${REPORT_LINES[@]}"; do
-  IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
-  r_arq_short="$(basename "${r_arquivo%%$'\n'*}" 2>/dev/null || echo "${r_arquivo}")"
-  [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
-  if [[ "$r_status" == "AUTH FALHOU" ]]; then
-    printf "${_C_RED}║${_C_RESET} %-17s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-18s ${_C_RED}║${_C_RESET}\n" \
-      "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-  else
-    printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
-      "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-  fi
-done
-printf "${_C_CYAN}╚═══════════════════╩══════════════════╩══════════════════╩════════════════════╝${_C_RESET}\n"
-echo ""
+_print_report "RELATÓRIO FINAL — Support Bundle Check" "${REPORT_LINES[@]}"
+
 [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
   log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]} — verifique credenciais manualmente."
 log "Para acompanhar a geração: tail -f ${LOG_DIR}/sb_bg_*.log"
@@ -981,53 +1127,71 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.14
+# NSX Edge Automation — Manual de Uso  v3.15
+
+## Scripts disponíveis
+
+| Script | Descrição |
+|---|---|
+| `nsx_sb_main.sh` | Fluxo completo: pre-check + geração de bundle |
+| `nsx_sb_main.sh --precheck-only` | Apenas pre-check + relatório (sem gerar/deletar) |
+| `nsx_sb_main.sh --clean-all` | Apaga todos os bundles + fluxo completo |
+| `nsx_sb_precheck.sh` | Idêntico a `--precheck-only`, script dedicado |
+| `test_connections.sh` | Testa conectividade SSH admin + root |
+| `admin_exec.sh` | Executa comando NSX CLI em todos os nodes |
+| `root_exec.sh` | Executa comando shell como root em todos os nodes |
+| `nsx_ssh_cli.sh` | SSH interativo para um node específico |
+
+## Uso rápido
+
+```bash
+cd ~/nsx-edge-automation/automations/support_bundle
+
+# Só verificar o estado dos bundles (sem gerar nada):
+./nsx_sb_precheck.sh
+# ou equivalente:
+./nsx_sb_main.sh --precheck-only
+
+# Fluxo completo (pre-check + geração):
+./nsx_sb_main.sh
+
+# Limpar tudo e gerar novo:
+./nsx_sb_main.sh --clean-all
+```
+
+## Relatório do pre-check
+
+Ao final do pre-check, é exibida uma tabela colorida:
+
+| Cor | Status | Significado |
+|---|---|---|
+| Verde | `RECENTE (≤7d)` | Bundle presente e recente — nenhuma ação necessária |
+| Amarelo | `ANTIGO (>7d)` | Bundle existente mas expirado — recomenda limpeza |
+| Ciano | `NENHUM` | Nenhum bundle encontrado — será gerado no fluxo completo |
+| Ciano | `EM ANDAMENTO` | Geração em curso — aguardar conclusão |
+| Vermelho | `AUTH FALHOU` | Credenciais admin inválidas — verificar manualmente |
+
+O relatório também é salvo em CSV em `logs/precheck_YYYYMMDD_HHMMSS.csv`.
+
+## Correções v3.15
+
+- Novo `nsx_sb_precheck.sh` — script dedicado de pre-check.
+- `nsx_sb_main.sh --precheck-only` — flag equivalente inline.
+- `_print_report()` em `common.sh` — função reutilizável de tabela colorida, com linha colorida por status (verde/amarelo/vermelho/ciano).
 
 ## Correções v3.14
 
-| Item corrigido | Antes (v3.13) | Depois (v3.14) |
+| Item | Antes | Depois |
 |---|---|---|
 | `_list_bundles()` | `grep '^sb_.*\.tgz$'` | `grep '\.tgz$'` — captura `support-bundle-*` |
-| `_list_bundles_with_age()` | `grep '^sb_.*\.tgz '` | `grep '\.tgz '` — consistência |
-| `delete_all_bundles()` loop | `while read … done <<< $var` | `mapfile -t _del_files` + `for` |
-| `delete_old_bundles()` loop | `while read … done <<< $var` | `mapfile -t _del_old` + `for` |
-
-### Sintomas eliminados
-
-**Bug 1 — arquivos ignorados no --clean-all:**
-Arquivos com prefixo `support-bundle-*` não correspondiam ao padrão
-`'^sb_.*\.tgz$'` e eram invisíveis para `_list_bundles()`.
-O log mostrava "3 bundle(s) para deletar" mas só 3 dos `sb_*` eram
-listados — os `support-bundle-*` nunca entravam no loop.
-
-**Bug 2 — loop de deleção abortava após 1º arquivo:**
-Com `set -euo pipefail`, o `while IFS= read -r f; do … done <<< "$var"`
-abortava silenciosamente quando qualquer subcomando interno retornava
-rc≠0, deletando apenas o primeiro arquivo e imprimindo
-"limpeza total concluída" prematuramente.
-`mapfile` + `for` resolve porque o array já está populado antes do loop.
-
-## Correções v3.13
-
-| Item corrigido | Antes (v3.12) | Depois (v3.13) |
-|---|---|---|
-| `_list_bundles()` | `root_cmd_tty` + grep remoto | `root_cmd` + grep local |
-| `_list_bundles_with_age()` | `root_cmd_tty` | `root_cmd` |
-| `delete_old_bundles()` rm -f | `root_cmd_tty` | `root_cmd` |
-| `delete_all_bundles()` rm -f | `root_cmd_tty` | `root_cmd` |
+| `_list_bundles_with_age()` | `grep '^sb_.*\.tgz '` | `grep '\.tgz '` |
+| `delete_all_bundles()` loop | `while read` | `mapfile + for` |
+| `delete_old_bundles()` loop | `while read` | `mapfile + for` |
 
 ## Deploy
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
-```
-
-## Uso
-
-```bash
-cd ~/nsx-edge-automation/automations/support_bundle
-./nsx_sb_main.sh
-./nsx_sb_main.sh --clean-all
 ```
 MANUALDOC
 
@@ -1046,14 +1210,15 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.14"
+echo "  Deploy concluído! v3.15"
 echo "================================================================"
 echo ""
-echo "  Correções v3.14:"
-echo "    _list_bundles / _list_bundles_with_age: grep '\.tgz\$' — captura support-bundle-*"
-echo "    delete_all_bundles / delete_old_bundles: mapfile + for — deleta todos os arquivos"
+echo "  Novidades v3.15:"
+echo "    nsx_sb_precheck.sh     — pre-check dedicado com relatório"
+echo "    nsx_sb_main.sh         — nova flag --precheck-only"
+echo "    common.sh _print_report — tabela colorida reutilizável"
 echo ""
 echo "Próximos passos:"
-echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
-echo "  2. cd ${AUTO_DIR} && ./nsx_sb_main.sh --clean-all"
+echo "  1. cd ${AUTO_DIR} && ./nsx_sb_precheck.sh"
+echo "  2. cd ${AUTO_DIR} && ./nsx_sb_main.sh"
 echo ""
