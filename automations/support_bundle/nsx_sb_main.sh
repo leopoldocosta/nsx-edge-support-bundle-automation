@@ -1,120 +1,137 @@
 #!/usr/bin/env bash
-# nsx_sb_main.sh — v2.8
-# Orchestrator: PRE-CHECK (3-stage) + Phase 1 (request SB)
-# Phase 2 (5-min polling) removed — monitoring is done externally.
-# Recommended: run inside screen or tmux
-#
-# PRE-CHECK stages:
-#   1. check_bundle_log_recent  — se o log indica bundle gerado nos últimos 7 dias → existe
-#   2. check_existing_bundle    — busca .tgz em file-store ou via 'get files'
-#   3. check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
+# nsx_sb_main.sh  — v3.9
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 
-need_cmd ssh
-need_cmd sshpass
-load_ips
-ask_admin_creds
-ask_root_creds
+need_cmd ssh; need_cmd sshpass
+load_ips; ask_admin_creds; ask_root_creds
+
+CLEAN_ALL=false
+[[ "${1:-}" == "--clean-all" ]] && CLEAN_ALL=true
 
 RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
 STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
-# ---- PRE-CHECK: 3-stage bundle detection ----
-log "=== PRE-CHECK: Verificando log e bundles existentes ==="
-declare -A SKIP_SB
-for ip in "${EDGE_IPS[@]}"; do
-  SKIP_SB["$ip"]="false"
-done
+declare -a REPORT_LINES=()
+# FIX v3.9 — array associativo para decisão de ação na PHASE 1.
+# Elimina bug onde BUNDLE_FILES_RECENT com múltiplas linhas quebrava
+# o parsing de string com pipe no REPORT_LINES, fazendo local_acao ficar
+# vazio e o bundle ser gerado mesmo quando deveria ser pulado.
+declare -A NODE_ACAO=()
+
+if [[ "$CLEAN_ALL" == true ]]; then
+  log_banner "CLEAN-ALL: Apagando TODOS os bundles existentes"
+  for ip in "${EDGE_IPS[@]}"; do
+    if ! enable_root_ssh "$ip"; then
+      printf '%s,clean_all,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
+        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      continue
+    fi
+    list_bundle_dir "$ip"
+    delete_all_bundles "$ip"
+    disable_root_ssh "$ip"
+    printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" \
+      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+  done
+fi
+
+log_banner "PRE-CHECK: Verificando bundles existentes"
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
-  enable_root_ssh "$ip"
 
-  # Exibe o log (informação ao operador) — retorno usado apenas para CSV
-  log_rc=0
-  check_bundle_log "$ip" || log_rc=$?
-  case "$log_rc" in
-    0) printf '%s,precheck,bundle_log,ok,%s\n'           "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
-    1) printf '%s,precheck,bundle_log,warn_errors,%s\n'  "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
-    2) printf '%s,precheck,bundle_log,not_found,%s\n'    "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
+  if ! enable_root_ssh "$ip"; then
+    printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
+      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
+    NODE_ACAO[$ip]="PULADO"
+    continue
+  fi
+
+  check_bundle_log "$ip" || true
+  check_bundle_status "$ip"
+
+  printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" \
+    | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+
+  case "$BUNDLE_STATUS" in
+    recent)
+      REPORT_LINES+=("${ip}|RECENTE (≤7d)|PULADO|${BUNDLE_FILES_RECENT}")
+      NODE_ACAO[$ip]="PULADO"
+      ;;
+    old)
+      delete_old_bundles "$ip"
+      printf '%s,precheck,deleted_old,ok,%s\n' "$ip" "$(date +%F_%T)" \
+        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      REPORT_LINES+=("${ip}|ANTIGO (>7d)|DEL+GERANDO|${BUNDLE_FILES_OLD}")
+      NODE_ACAO[$ip]="GERANDO"
+      ;;
+    none)
+      REPORT_LINES+=("${ip}|NENHUM|GERANDO|—")
+      NODE_ACAO[$ip]="GERANDO"
+      ;;
+    inprogress)
+      REPORT_LINES+=("${ip}|EM ANDAMENTO|PULADO|—")
+      NODE_ACAO[$ip]="PULADO"
+      ;;
   esac
-
-  # ------------------------------------------------------------------
-  # Stage 1: log recente (7 dias) → considera bundle como existente
-  # ------------------------------------------------------------------
-  recent_rc=0
-  check_bundle_log_recent "$ip" || recent_rc=$?
-
-  if [[ "$recent_rc" -eq 0 ]]; then
-    log "${ip}: [Stage 1] bundle recente detectado no log — verificando se usuário quer gerar novo."
-    printf '%s,precheck,stage1_log_recent,found,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    existing_label="[log recente ≤ 7 dias]"
-    if ! prompt_new_bundle "$ip" "${existing_label}"; then
-      SKIP_SB["$ip"]="true"
-      printf '%s,precheck,existing_bundle,skipped_log_recent,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    else
-      log "${ip}: usuário solicitou novo bundle — prosseguindo."
-      printf '%s,precheck,existing_bundle,new_requested,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    fi
-    continue
-  fi
-
-  # ------------------------------------------------------------------
-  # Stage 2: buscar arquivo .tgz em file-store / 'get files'
-  # ------------------------------------------------------------------
-  existing_files=""
-  if existing_files="$(check_existing_bundle "$ip")"; then
-    log "${ip}: [Stage 2] bundle(s) existente(s) encontrado(s) em file-store."
-    printf '%s,precheck,stage2_filestore,found,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    if ! prompt_new_bundle "$ip" "$existing_files"; then
-      SKIP_SB["$ip"]="true"
-      printf '%s,precheck,existing_bundle,skipped,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    else
-      log "${ip}: usuário solicitou novo bundle — prosseguindo."
-      printf '%s,precheck,existing_bundle,new_requested,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    fi
-    continue
-  fi
-
-  # ------------------------------------------------------------------
-  # Stage 3: verificar se há geração em andamento
-  # ------------------------------------------------------------------
-  if check_bundle_in_progress "$ip"; then
-    log_warn "${ip}: [Stage 3] geração de bundle já está em andamento — pulando solicitação."
-    printf '%s,precheck,stage3_in_progress,detected,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    SKIP_SB["$ip"]="true"
-    continue
-  fi
-
-  # Nenhum bundle detectado em nenhum dos 3 estágios — gerar novo
-  log "${ip}: nenhum bundle existente ou em andamento — será gerado."
-  printf '%s,precheck,existing_bundle,none,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-# ---- PHASE 1: Enable root SSH + Request Support Bundle ----
-log "=== PHASE 1: Support Bundle Request ==="
+log_banner "PHASE 1: Support Bundle Request (background)"
+
 for ip in "${EDGE_IPS[@]}"; do
-  if [[ "${SKIP_SB[$ip]}" == "true" ]]; then
-    log "${ip}: pulando solicitação (bundle existente ou em andamento)."
+  if _node_auth_failed "$ip"; then
+    log "${ip}: pulando (falha de autenticação admin)."
     continue
   fi
-  enable_root_ssh "$ip"
-  printf '%s,phase1,root_ssh_enabled,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+
+  # FIX v3.9 — usa array associativo em vez de parsing de string com pipe
+  if [[ "${NODE_ACAO[$ip]:-}" == "PULADO" ]]; then
+    log "${ip}: pulando solicitação de bundle."
+    continue
+  fi
+
   request_support_bundle "$ip"
-  printf '%s,phase1,sb_requested,ok,%s\n'     "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+  printf '%s,phase1,sb_requested_bg,ok,%s\n' "$ip" "$(date +%F_%T)" \
+    | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
-log "Phase 1 done. Bundles requested — monitoring is done externally."
 
-# ---- FINAL: Disable root SSH on all nodes ----
-log "=== FINAL: Disabling root SSH ==="
+log_ok "Phase 1 done — bundles disparados em background."
+
+log_banner "FINAL: Disabling root SSH"
 for ip in "${EDGE_IPS[@]}"; do
+  _node_auth_failed "$ip" && continue
   disable_root_ssh "$ip" || true
-  printf '%s,final,root_ssh_disabled,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+  printf '%s,final,root_ssh_disabled,ok,%s\n' "$ip" "$(date +%F_%T)" \
+    | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-log_ok "Done. Status CSV: ${STATUS_CSV}"
+echo ""
+printf "${_C_CYAN}╔══════════════════════════════════════════════════════════════════════════════╗${_C_RESET}\n"
+printf "${_C_CYAN}║  RELATÓRIO FINAL — Support Bundle Check  %-35s║${_C_RESET}\n" "$(date '+%F %T')"
+printf "${_C_CYAN}╠═══════════════════╦══════════════════╦══════════════════╦════════════════════╣${_C_RESET}\n"
+printf "${_C_CYAN}║ %-17s ║ %-16s ║ %-16s ║ %-18s ║${_C_RESET}\n" "NODE" "STATUS" "AÇÃO" "ARQUIVO"
+printf "${_C_CYAN}╠═══════════════════╬══════════════════╬══════════════════╬════════════════════╣${_C_RESET}\n"
+for entry in "${REPORT_LINES[@]}"; do
+  IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
+  r_arq_short="$(basename "${r_arquivo%%$'\n'*}" 2>/dev/null || echo "${r_arquivo}")"
+  [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
+  if [[ "$r_status" == "AUTH FALHOU" ]]; then
+    printf "${_C_RED}║${_C_RESET} %-17s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-18s ${_C_RED}║${_C_RESET}\n" \
+      "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+  else
+    printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
+      "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+  fi
+done
+printf "${_C_CYAN}╚═══════════════════╩══════════════════╩══════════════════╩════════════════════╝${_C_RESET}\n"
+echo ""
+[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
+  log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]} — verifique credenciais manualmente."
+log "Para acompanhar a geração: tail -f ${LOG_DIR}/sb_bg_*.log"
+log_ok "Status CSV: ${STATUS_CSV}"
+
 prompt_clear_creds

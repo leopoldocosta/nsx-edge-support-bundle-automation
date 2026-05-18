@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.8
+# deploy_nsx_sb_check.sh  v3.9
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -23,7 +23,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.8"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.9"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -132,21 +132,7 @@ BUNDLE_FILES_OLD=""
 # Array global de nodes com falha de autenticação admin
 declare -a NODE_AUTH_FAILED=()
 
-# ---------------------------------------------------------------------------
-# _BUNDLE_GREP — padrão ERE para identificar arquivos de support bundle
-# Detecta: support-bundle*, support_bundle*, sb_*, e qualquer *.tgz
-# ---------------------------------------------------------------------------
 _BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
-
-# ---------------------------------------------------------------------------
-# _BUNDLE_PROC_GREP — padrão preciso para detectar geração em andamento
-# Processos reais observados no NSX durante geração de support bundle:
-#   sudo .../gen_support_bundle ...
-#   /bin/sh .../gen_support_bundle ...
-#   python3 .../support_bundles/__self__.py ...
-# NÃO usa padrões genéricos como 'support_bundle' que colidiriam com o
-# nome do diretório do próprio script.
-# ---------------------------------------------------------------------------
 _BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
 
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
@@ -166,9 +152,6 @@ _box_line(){
   printf '%s' "${out}"
 }
 
-# ---------------------------------------------------------------------------
-# _is_auth_failed OUTPUT
-# ---------------------------------------------------------------------------
 _is_auth_failed(){
   echo "$1" | grep -qiE 'permission denied|authentication failed|publickey|no supported authentication'
 }
@@ -265,11 +248,6 @@ prompt_clear_creds(){
   else clear_creds; fi
 }
 
-# ---------------------------------------------------------------------------
-# ssh_admin / ssh_root
-#   -o LogLevel=ERROR suprime warnings do cliente SSH local (ex: opções
-#   obsoletas no /etc/ssh/ssh_config do host de monitoramento).
-# ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
   export SSHPASS="${NSX_PASS}"
@@ -299,9 +277,6 @@ root_cmd(){      local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
 admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
 root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
-# ---------------------------------------------------------------------------
-# _node_auth_failed IP
-# ---------------------------------------------------------------------------
 _node_auth_failed(){
   local ip="$1"
   local f
@@ -311,9 +286,6 @@ _node_auth_failed(){
   return 1
 }
 
-# ---------------------------------------------------------------------------
-# enable_root_ssh IP
-# ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   local out rc=0
@@ -338,9 +310,6 @@ enable_root_ssh(){
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# disable_root_ssh IP
-# ---------------------------------------------------------------------------
 disable_root_ssh(){
   local ip="$1"
   local out rc=0
@@ -354,9 +323,6 @@ disable_root_ssh(){
   [[ -n "$out" ]] && log "${ip}: [clear ssh root-login] ${out}"
 }
 
-# ---------------------------------------------------------------------------
-# check_bundle_log IP
-# ---------------------------------------------------------------------------
 check_bundle_log(){
   local ip="$1"
   local log_file="/var/log/support_bundle.log"
@@ -380,9 +346,6 @@ check_bundle_log(){
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# list_bundle_dir IP
-# ---------------------------------------------------------------------------
 list_bundle_dir(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -403,10 +366,6 @@ list_bundle_dir(){
   echo ""
 }
 
-# ---------------------------------------------------------------------------
-# _bundle_age_days IP FILEPATH
-#   Mantida por compatibilidade. No fluxo principal, use _list_bundles_with_age.
-# ---------------------------------------------------------------------------
 _bundle_age_days(){
   local ip="$1" fpath="$2"
   local now_epoch file_epoch age
@@ -421,36 +380,16 @@ _bundle_age_days(){
   echo "$age"
 }
 
-# ---------------------------------------------------------------------------
-# _list_bundles IP
-#   Retorna apenas os nomes dos arquivos .tgz (um por linha).
-# ---------------------------------------------------------------------------
 _list_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
   root_cmd_tty "$ip" "ls -1 ${dir}/ 2>/dev/null | grep -E '${_BUNDLE_GREP}' || true"
 }
 
-# ---------------------------------------------------------------------------
-# _list_bundles_with_age IP
-#
-#   FIX v3.8 — uma única chamada SSH retorna "NOME EPOCH" para todos os
-#   bundles, usando stat em loop no nó. A idade é calculada localmente com
-#   $(date +%s) do host de monitoramento, evitando múltiplas conexões SSH
-#   por arquivo que falhavam silenciosamente com strings vazias → age=999.
-#
-#   Saída (stdout): linhas no formato "NOME_DO_ARQUIVO EPOCH"
-#   Exemplo:
-#     bundle-edge019.tgz 1648396800
-#     sb_172_18_214_19_20260514_175712.tgz 1747267200
-# ---------------------------------------------------------------------------
 _list_bundles_with_age(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
   local bundle_grep="${_BUNDLE_GREP}"
-
-  # Uma chamada SSH: lista todos .tgz, filtra pelo padrão de bundles,
-  # e retorna "basename epoch" de cada arquivo.
   root_cmd_tty "$ip" \
     "cd '${dir}' 2>/dev/null && \
      for f in \$(ls -1 2>/dev/null | grep -E '${bundle_grep}' || true); do \
@@ -459,13 +398,6 @@ _list_bundles_with_age(){
      done"
 }
 
-# ---------------------------------------------------------------------------
-# check_bundle_status IP
-#
-#   FIX v3.8: usa _list_bundles_with_age() — UMA chamada SSH retorna todos
-#   os bundles com seu epoch. Idade calculada localmente. Elimina o problema
-#   de múltiplas chamadas SSH falhando silenciosamente e causando age=999.
-# ---------------------------------------------------------------------------
 check_bundle_status(){
   local ip="$1"
   BUNDLE_STATUS="none"
@@ -477,7 +409,6 @@ check_bundle_status(){
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
   list_bundle_dir "$ip"
 
-  # Detecta geração em andamento usando padrão preciso (_BUNDLE_PROC_GREP)
   local proc_out
   proc_out="$(root_cmd_tty "$ip" \
     "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
@@ -487,10 +418,8 @@ check_bundle_status(){
     BUNDLE_STATUS="inprogress"; return 0
   fi
 
-  # Uma única chamada SSH: retorna "nome epoch" por bundle
   local raw_pairs
   raw_pairs="$(_list_bundles_with_age "$ip")"
-  # Extrai apenas os nomes para o log de detecção
   local all_bundles
   all_bundles="$(echo "$raw_pairs" | awk '{print $1}' | grep -v '^$' || true)"
 
@@ -505,7 +434,6 @@ check_bundle_status(){
   bundle_count="$(echo "$all_bundles" | grep -c '.' || true)"
   log "${ip}: ${bundle_count} bundle(s) encontrado(s)."
 
-  # Calcula idade localmente (evita SSH extra por arquivo)
   local now_epoch
   now_epoch="$(date +%s)"
 
@@ -515,16 +443,13 @@ check_bundle_status(){
     fname="$(echo "$pair" | awk '{print $1}')"
     fepoch="$(echo "$pair" | awk '{print $2}' | tr -cd '0-9')"
     [[ -z "$fname" ]] && continue
-
     if [[ -z "$fepoch" || "$fepoch" == "0" ]]; then
       age=999
     else
       age=$(( (now_epoch - fepoch) / 86400 ))
     fi
-
     fpath="${dir}/${fname}"
     log "${ip}: arquivo '${fname}' → ${age} dia(s)."
-
     if [[ "$age" -le 7 ]]; then
       BUNDLE_FILES_RECENT+="${fpath}"$'\n'
     else
@@ -583,9 +508,6 @@ check_bundle_status(){
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# delete_old_bundles IP
-# ---------------------------------------------------------------------------
 delete_old_bundles(){
   local ip="$1"
   [[ -z "$BUNDLE_FILES_OLD" ]] && return 0
@@ -601,9 +523,6 @@ delete_old_bundles(){
   done <<< "$BUNDLE_FILES_OLD"
 }
 
-# ---------------------------------------------------------------------------
-# delete_all_bundles IP  (--clean-all)
-# ---------------------------------------------------------------------------
 delete_all_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
@@ -630,9 +549,6 @@ delete_all_bundles(){
   log_ok "${ip}: limpeza total concluída."
 }
 
-# ---------------------------------------------------------------------------
-# request_support_bundle IP
-# ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
@@ -665,9 +581,6 @@ request_support_bundle(){
 COMMON
 chmod +x "${LIB_DIR}/common.sh"
 
-# ---------------------------------------------------------------------------
-# edge_nodes.example
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/edge_nodes.example" <<'EXAMPLE'
 # edge_nodes.example — copie para edge_nodes.txt e edite
 192.168.1.10
@@ -675,9 +588,6 @@ cat > "${AUTO_DIR}/edge_nodes.example" <<'EXAMPLE'
 192.168.1.12
 EXAMPLE
 
-# ---------------------------------------------------------------------------
-# install_dependencies.sh
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/install_dependencies.sh" <<'INST'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -693,18 +603,12 @@ echo "[ERR] Instale sshpass manualmente."; exit 1
 INST
 chmod +x "${AUTO_DIR}/install_dependencies.sh"
 
-# ---------------------------------------------------------------------------
-# setup_keys.sh
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/setup_keys.sh" <<'SETUP'
 #!/usr/bin/env bash
 echo "[INFO] Autenticação via sshpass (senha). Execute ./test_connections.sh para validar."
 SETUP
 chmod +x "${AUTO_DIR}/setup_keys.sh"
 
-# ---------------------------------------------------------------------------
-# test_connections.sh
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/test_connections.sh" <<'TESTC'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -741,11 +645,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.8
+# nsx_sb_main.sh  — v3.9
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.8
+# nsx_sb_main.sh  — v3.9
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -762,6 +666,11 @@ STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
 declare -a REPORT_LINES=()
+# FIX v3.9 — array associativo para decisão de ação na PHASE 1.
+# Elimina bug onde BUNDLE_FILES_RECENT com múltiplas linhas quebrava
+# o parsing de string com pipe no REPORT_LINES, fazendo local_acao ficar
+# vazio e o bundle ser gerado mesmo quando deveria ser pulado.
+declare -A NODE_ACAO=()
 
 if [[ "$CLEAN_ALL" == true ]]; then
   log_banner "CLEAN-ALL: Apagando TODOS os bundles existentes"
@@ -788,6 +697,7 @@ for ip in "${EDGE_IPS[@]}"; do
     printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
       | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
+    NODE_ACAO[$ip]="PULADO"
     continue
   fi
 
@@ -800,18 +710,22 @@ for ip in "${EDGE_IPS[@]}"; do
   case "$BUNDLE_STATUS" in
     recent)
       REPORT_LINES+=("${ip}|RECENTE (≤7d)|PULADO|${BUNDLE_FILES_RECENT}")
+      NODE_ACAO[$ip]="PULADO"
       ;;
     old)
       delete_old_bundles "$ip"
       printf '%s,precheck,deleted_old,ok,%s\n' "$ip" "$(date +%F_%T)" \
         | tee -a "$RUN_LOG" >> "$STATUS_CSV"
       REPORT_LINES+=("${ip}|ANTIGO (>7d)|DEL+GERANDO|${BUNDLE_FILES_OLD}")
+      NODE_ACAO[$ip]="GERANDO"
       ;;
     none)
       REPORT_LINES+=("${ip}|NENHUM|GERANDO|—")
+      NODE_ACAO[$ip]="GERANDO"
       ;;
     inprogress)
       REPORT_LINES+=("${ip}|EM ANDAMENTO|PULADO|—")
+      NODE_ACAO[$ip]="PULADO"
       ;;
   esac
 done
@@ -824,15 +738,8 @@ for ip in "${EDGE_IPS[@]}"; do
     continue
   fi
 
-  local_acao=""
-  for entry in "${REPORT_LINES[@]}"; do
-    if [[ "${entry%%|*}" == "$ip" ]]; then
-      local_acao="$(echo "$entry" | cut -d'|' -f3)"
-      break
-    fi
-  done
-
-  if [[ "$local_acao" == "PULADO" ]]; then
+  # FIX v3.9 — usa array associativo em vez de parsing de string com pipe
+  if [[ "${NODE_ACAO[$ip]:-}" == "PULADO" ]]; then
     log "${ip}: pulando solicitação de bundle."
     continue
   fi
@@ -881,9 +788,6 @@ prompt_clear_creds
 MAIN
 chmod +x "${AUTO_DIR}/nsx_sb_main.sh"
 
-# ---------------------------------------------------------------------------
-# admin_exec.sh
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/admin_exec.sh" <<'ADMX'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -903,9 +807,6 @@ prompt_clear_creds
 ADMX
 chmod +x "${AUTO_DIR}/admin_exec.sh"
 
-# ---------------------------------------------------------------------------
-# root_exec.sh
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/root_exec.sh" <<'ROTX'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -932,9 +833,6 @@ prompt_clear_creds
 ROTX
 chmod +x "${AUTO_DIR}/root_exec.sh"
 
-# ---------------------------------------------------------------------------
-# nsx_ssh_cli.sh
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_ssh_cli.sh" <<'CLISCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -967,11 +865,14 @@ unset SSHPASS
 CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
-# ---------------------------------------------------------------------------
-# MANUAL.md
-# ---------------------------------------------------------------------------
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.8
+# NSX Edge Automation — Manual de Uso  v3.9
+
+## Correções v3.9
+
+| Problema | Causa raiz | Correção |
+|---|---|---|
+| Bundle gerado mesmo com recente presente (2+ bundles) | `BUNDLE_FILES_RECENT` com quebras de linha fragmentava o parsing de `REPORT_LINES` com `cut -d'|'` | Array associativo `declare -A NODE_ACAO` separa decisão da fase 1 do relatório final |
 
 ## Correções v3.8
 
@@ -983,8 +884,23 @@ cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
 
 | Problema | Causa raiz | Correção |
 |---|---|---|
-| Falso positivo "geração em andamento" | `ps grep` usava padrão genérico que coincidia com o nome do próprio script | Novo `_BUNDLE_PROC_GREP`: `gen_support_bundle\|support_bundles/__self__\.py` — exclusivo do NSX |
-| Linha `/etc/ssh/ssh_config: Unsupported option` aparecia nos boxes | Warnings do cliente SSH local capturados via `2>&1` | `-o LogLevel=ERROR` em `ssh_admin` e `ssh_root` |
+| Falso positivo "geração em andamento" | `ps grep` usava padrão genérico que coincidia com o nome do próprio script | Novo `_BUNDLE_PROC_GREP`: `gen_support_bundle|support_bundles/__self__.py` |
+| Linha `ssh_config: Unsupported option` nos boxes | Warnings do cliente SSH local via `2>&1` | `-o LogLevel=ERROR` em `ssh_admin` e `ssh_root` |
+
+## Como funciona a decisão de ação (v3.9)
+
+```bash
+# PRE-CHECK popula array associativo:
+case "$BUNDLE_STATUS" in
+  recent|inprogress) NODE_ACAO[$ip]="PULADO" ;;
+  old|none)          NODE_ACAO[$ip]="GERANDO" ;;
+esac
+
+# PHASE 1 consulta diretamente — sem parsing de string:
+if [[ "${NODE_ACAO[$ip]:-}" == "PULADO" ]]; then
+  continue
+fi
+```
 
 ## Como funciona a detecção de bundles (v3.8)
 
@@ -995,28 +911,8 @@ for f in $(ls -1 | grep -E '<_BUNDLE_GREP>'); do
   ep=$(stat -c '%Y' "$f")
   echo "$f $ep"
 done
-# Saída: "bundle-edge019.tgz 1648396800"
-#        "sb_172_18_214_19_20260514_175712.tgz 1747267200"
 # Idade calculada localmente: age=$(( (now - epoch) / 86400 ))
 ```
-
-## Como identificar geração em andamento (NSX)
-
-```bash
-ps -ef | grep -E 'gen_support_bundle|support_bundles/__self__\.py' | grep -v grep
-```
-
-## Padrão de detecção de bundles (`_BUNDLE_GREP`)
-
-| Nome do arquivo | Detectado? |
-|---|---|
-| `support-bundle-172-18-214-18-20260514.tgz` | ✔ |
-| `support_bundle_20220216_0132.tgz` | ✔ |
-| `sb_172_18_214_17_20260514_172052.tgz` | ✔ |
-| `bundle-edge019.tgz` | ✔ |
-| `2026-05-05-01h10am-utc-3.tgz` | ✔ |
-| `qualquer-nome-manual.tgz` | ✔ |
-| `flow-cache-dump-0.gz` | ✗ |
 
 ## Deploy
 
@@ -1049,16 +945,16 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.8"
+echo "  Deploy concluído! v3.9"
 echo "================================================================"
 echo ""
-echo "  Correções v3.8:"
+echo "  Correções v3.9:"
+echo "    NODE_ACAO[]: array associativo separa decisão da fase 1 do relatório"
+echo "    Nenhum parsing de string com pipe — elimina bug de multi-bundle recente"
+echo ""
+echo "  Herdado v3.8:"
 echo "    _list_bundles_with_age(): UMA chamada SSH por node para todos os bundles"
 echo "    Idade calculada localmente — sem mais age=999 em bundles novos"
-echo ""
-echo "  Herdado v3.7:"
-echo "    _BUNDLE_PROC_GREP preciso: gen_support_bundle|support_bundles/__self__.py"
-echo "    LogLevel=ERROR em ssh_admin/ssh_root: sem warnings do cliente SSH local"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
