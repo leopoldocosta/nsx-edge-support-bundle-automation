@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.7
+# deploy_nsx_sb_check.sh  v3.8
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -23,7 +23,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.7"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.8"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -58,33 +58,37 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.7
+# lib/common.sh  — v3.8
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.7
+# lib/common.sh  — v3.8
 #
-# CORREÇÃO v3.7 — dois bugs corrigidos:
+# CORREÇÃO v3.8 — bug de classificação de bundles:
 #
-#   Bug 1: falso positivo "geração em andamento" no ps grep
-#     O padrão anterior 'support_bundle|support-bundle|napi.*bundle' capturava
-#     o próprio processo do script (nsx_sb_main.sh contém "support_bundle" no
-#     nome do diretório na linha de comando do bash).
-#     Novo padrão preciso, baseado nos processos reais observados no NSX:
-#       gen_support_bundle      — sudo/sh que dispara a geração
-#       support_bundles/__self__.py — python3 que executa a geração
-#     Esses padrões são exclusivos do NSX e jamais coincidem com nosso script.
+#   Causa raiz:
+#     _bundle_age_days() fazia UMA chamada SSH por arquivo (stat + date).
+#     Quando havia 2+ bundles, a segunda chamada SSH podia retornar string
+#     vazia ou falhar silenciosamente, fazendo age=999 (fallback), e o bundle
+#     NOVO era classificado como ANTIGO — era deletado erroneamente.
 #
-#   Bug 2: warnings do cliente SSH local contaminavam saída remota
-#     Mensagens como "/etc/ssh/ssh_config line 59: Unsupported option
-#     gssapiauthentication" vinham do cliente SSH do host de monitoramento
-#     e apareciam nos boxes de ls/log porque root_cmd_tty usa 2>&1.
-#     Correção: adicionado -o LogLevel=ERROR em ssh_admin e ssh_root,
-#     suprimindo todos os warnings/notices do cliente SSH local.
+#   Correção:
+#     Nova função _list_bundles_with_age() faz UMA ÚNICA chamada SSH que
+#     retorna "NOME EPOCH" para todos os bundles de uma vez, usando:
+#       for f in $(ls | grep ...); do stat -c '%n %Y' "$f"; done
+#     A idade é calculada localmente com a hora do próprio host.
+#     Zero chamadas SSH extras por arquivo.
 #
-# Herdado v3.6:
-#   - enable_root_ssh detecta Permission denied e registra NODE_AUTH_FAILED[]
-#   - disable_root_ssh loga [WARN] em vez de silenciar falha de auth
+#   Impacto:
+#     check_bundle_status() agora usa _list_bundles_with_age() em vez de
+#     _list_bundles() + _bundle_age_days() em loop.
+#     _bundle_age_days() mantida por compatibilidade mas não usada no fluxo
+#     principal.
+#
+# Herdado v3.7:
+#   - _BUNDLE_PROC_GREP preciso: gen_support_bundle|support_bundles/__self__.py
+#   - LogLevel=ERROR em ssh_admin/ssh_root
+#   - enable_root_ssh detecta Permission denied → NODE_AUTH_FAILED[]
 #   - nsx_sb_main.sh pula nodes em NODE_AUTH_FAILED[] em todas as fases
 #
 # Herdado v3.5:
@@ -136,14 +140,12 @@ _BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
 
 # ---------------------------------------------------------------------------
 # _BUNDLE_PROC_GREP — padrão preciso para detectar geração em andamento
-#
 # Processos reais observados no NSX durante geração de support bundle:
 #   sudo .../gen_support_bundle ...
 #   /bin/sh .../gen_support_bundle ...
 #   python3 .../support_bundles/__self__.py ...
-#
 # NÃO usa padrões genéricos como 'support_bundle' que colidiriam com o
-# nome do diretório do nosso próprio script.
+# nome do diretório do próprio script.
 # ---------------------------------------------------------------------------
 _BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
 
@@ -266,8 +268,7 @@ prompt_clear_creds(){
 # ---------------------------------------------------------------------------
 # ssh_admin / ssh_root
 #   -o LogLevel=ERROR suprime warnings do cliente SSH local (ex: opções
-#   obsoletas no /etc/ssh/ssh_config do host de monitoramento) que
-#   contaminavam a saída dos comandos remotos capturados via 2>&1.
+#   obsoletas no /etc/ssh/ssh_config do host de monitoramento).
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -404,6 +405,7 @@ list_bundle_dir(){
 
 # ---------------------------------------------------------------------------
 # _bundle_age_days IP FILEPATH
+#   Mantida por compatibilidade. No fluxo principal, use _list_bundles_with_age.
 # ---------------------------------------------------------------------------
 _bundle_age_days(){
   local ip="$1" fpath="$2"
@@ -421,6 +423,7 @@ _bundle_age_days(){
 
 # ---------------------------------------------------------------------------
 # _list_bundles IP
+#   Retorna apenas os nomes dos arquivos .tgz (um por linha).
 # ---------------------------------------------------------------------------
 _list_bundles(){
   local ip="$1"
@@ -429,7 +432,39 @@ _list_bundles(){
 }
 
 # ---------------------------------------------------------------------------
+# _list_bundles_with_age IP
+#
+#   FIX v3.8 — uma única chamada SSH retorna "NOME EPOCH" para todos os
+#   bundles, usando stat em loop no nó. A idade é calculada localmente com
+#   $(date +%s) do host de monitoramento, evitando múltiplas conexões SSH
+#   por arquivo que falhavam silenciosamente com strings vazias → age=999.
+#
+#   Saída (stdout): linhas no formato "NOME_DO_ARQUIVO EPOCH"
+#   Exemplo:
+#     bundle-edge019.tgz 1648396800
+#     sb_172_18_214_19_20260514_175712.tgz 1747267200
+# ---------------------------------------------------------------------------
+_list_bundles_with_age(){
+  local ip="$1"
+  local dir="/var/vmware/nsx/file-store"
+  local bundle_grep="${_BUNDLE_GREP}"
+
+  # Uma chamada SSH: lista todos .tgz, filtra pelo padrão de bundles,
+  # e retorna "basename epoch" de cada arquivo.
+  root_cmd_tty "$ip" \
+    "cd '${dir}' 2>/dev/null && \
+     for f in \$(ls -1 2>/dev/null | grep -E '${bundle_grep}' || true); do \
+       ep=\$(stat -c '%Y' \"\$f\" 2>/dev/null || echo 0); \
+       echo \"\$f \$ep\"; \
+     done"
+}
+
+# ---------------------------------------------------------------------------
 # check_bundle_status IP
+#
+#   FIX v3.8: usa _list_bundles_with_age() — UMA chamada SSH retorna todos
+#   os bundles com seu epoch. Idade calculada localmente. Elimina o problema
+#   de múltiplas chamadas SSH falhando silenciosamente e causando age=999.
 # ---------------------------------------------------------------------------
 check_bundle_status(){
   local ip="$1"
@@ -443,7 +478,6 @@ check_bundle_status(){
   list_bundle_dir "$ip"
 
   # Detecta geração em andamento usando padrão preciso (_BUNDLE_PROC_GREP)
-  # Evita falso positivo com o nome do próprio script ou diretório.
   local proc_out
   proc_out="$(root_cmd_tty "$ip" \
     "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
@@ -453,8 +487,13 @@ check_bundle_status(){
     BUNDLE_STATUS="inprogress"; return 0
   fi
 
+  # Uma única chamada SSH: retorna "nome epoch" por bundle
+  local raw_pairs
+  raw_pairs="$(_list_bundles_with_age "$ip")"
+  # Extrai apenas os nomes para o log de detecção
   local all_bundles
-  all_bundles="$(_list_bundles "$ip")"
+  all_bundles="$(echo "$raw_pairs" | awk '{print $1}' | grep -v '^$' || true)"
+
   log "${ip}: [bundles detectados] resultado bruto: '${all_bundles:-<vazio>}'"
 
   if [[ -z "$all_bundles" ]]; then
@@ -466,18 +505,32 @@ check_bundle_status(){
   bundle_count="$(echo "$all_bundles" | grep -c '.' || true)"
   log "${ip}: ${bundle_count} bundle(s) encontrado(s)."
 
-  local f age fpath
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    fpath="${dir}/${f}"
-    age="$(_bundle_age_days "$ip" "$fpath")"
-    log "${ip}: arquivo '${f}' → ${age} dia(s)."
+  # Calcula idade localmente (evita SSH extra por arquivo)
+  local now_epoch
+  now_epoch="$(date +%s)"
+
+  local fname fepoch age fpath
+  while IFS= read -r pair; do
+    [[ -z "$pair" ]] && continue
+    fname="$(echo "$pair" | awk '{print $1}')"
+    fepoch="$(echo "$pair" | awk '{print $2}' | tr -cd '0-9')"
+    [[ -z "$fname" ]] && continue
+
+    if [[ -z "$fepoch" || "$fepoch" == "0" ]]; then
+      age=999
+    else
+      age=$(( (now_epoch - fepoch) / 86400 ))
+    fi
+
+    fpath="${dir}/${fname}"
+    log "${ip}: arquivo '${fname}' → ${age} dia(s)."
+
     if [[ "$age" -le 7 ]]; then
       BUNDLE_FILES_RECENT+="${fpath}"$'\n'
     else
       BUNDLE_FILES_OLD+="${fpath}"$'\n'
     fi
-  done <<< "$all_bundles"
+  done <<< "$raw_pairs"
 
   BUNDLE_FILES_RECENT="${BUNDLE_FILES_RECENT%$'\n'}"
   BUNDLE_FILES_OLD="${BUNDLE_FILES_OLD%$'\n'}"
@@ -688,11 +741,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.7
+# nsx_sb_main.sh  — v3.8
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.7
+# nsx_sb_main.sh  — v3.8
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -918,7 +971,13 @@ chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 # MANUAL.md
 # ---------------------------------------------------------------------------
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.7
+# NSX Edge Automation — Manual de Uso  v3.8
+
+## Correções v3.8
+
+| Problema | Causa raiz | Correção |
+|---|---|---|
+| Bundle novo classificado como ANTIGO e deletado erroneamente | `_bundle_age_days()` fazia uma chamada SSH por arquivo; a 2ª+ chamada podia retornar string vazia → `age=999` | Nova `_list_bundles_with_age()`: **uma única chamada SSH** retorna `"NOME EPOCH"` para todos os bundles; idade calculada localmente |
 
 ## Correções v3.7
 
@@ -927,17 +986,24 @@ cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
 | Falso positivo "geração em andamento" | `ps grep` usava padrão genérico que coincidia com o nome do próprio script | Novo `_BUNDLE_PROC_GREP`: `gen_support_bundle\|support_bundles/__self__\.py` — exclusivo do NSX |
 | Linha `/etc/ssh/ssh_config: Unsupported option` aparecia nos boxes | Warnings do cliente SSH local capturados via `2>&1` | `-o LogLevel=ERROR` em `ssh_admin` e `ssh_root` |
 
+## Como funciona a detecção de bundles (v3.8)
+
+```bash
+# Uma única chamada SSH por node:
+cd /var/vmware/nsx/file-store
+for f in $(ls -1 | grep -E '<_BUNDLE_GREP>'); do
+  ep=$(stat -c '%Y' "$f")
+  echo "$f $ep"
+done
+# Saída: "bundle-edge019.tgz 1648396800"
+#        "sb_172_18_214_19_20260514_175712.tgz 1747267200"
+# Idade calculada localmente: age=$(( (now - epoch) / 86400 ))
+```
+
 ## Como identificar geração em andamento (NSX)
 
 ```bash
 ps -ef | grep -E 'gen_support_bundle|support_bundles/__self__\.py' | grep -v grep
-```
-
-Processos esperados durante geração:
-```
-sudo   .../gen_support_bundle /image/... <args>
-/bin/sh .../gen_support_bundle /image/... <args>
-python3 .../support_bundles/__self__.py /image/... <args>
 ```
 
 ## Padrão de detecção de bundles (`_BUNDLE_GREP`)
@@ -947,6 +1013,8 @@ python3 .../support_bundles/__self__.py /image/... <args>
 | `support-bundle-172-18-214-18-20260514.tgz` | ✔ |
 | `support_bundle_20220216_0132.tgz` | ✔ |
 | `sb_172_18_214_17_20260514_172052.tgz` | ✔ |
+| `bundle-edge019.tgz` | ✔ |
+| `2026-05-05-01h10am-utc-3.tgz` | ✔ |
 | `qualquer-nome-manual.tgz` | ✔ |
 | `flow-cache-dump-0.gz` | ✗ |
 
@@ -981,10 +1049,14 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.7"
+echo "  Deploy concluído! v3.8"
 echo "================================================================"
 echo ""
-echo "  Correções v3.7:"
+echo "  Correções v3.8:"
+echo "    _list_bundles_with_age(): UMA chamada SSH por node para todos os bundles"
+echo "    Idade calculada localmente — sem mais age=999 em bundles novos"
+echo ""
+echo "  Herdado v3.7:"
 echo "    _BUNDLE_PROC_GREP preciso: gen_support_bundle|support_bundles/__self__.py"
 echo "    LogLevel=ERROR em ssh_admin/ssh_root: sem warnings do cliente SSH local"
 echo ""
