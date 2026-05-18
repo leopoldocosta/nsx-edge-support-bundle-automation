@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/common.sh
+# lib/common.sh — v3.13
 # Shared library for all NSX Edge automations.
 # Provides: SSH access (admin + root), IP loading, credential handling.
 #
@@ -44,8 +44,6 @@ need_cmd(){
 
 # ---------------------------------------------------------------------------
 # IP Management
-# IPs live in edge_nodes.txt inside each automation's own folder.
-# Never committed. Template: edge_nodes.example
 # ---------------------------------------------------------------------------
 collect_ips(){
   if [[ -f "${EDGE_EXAMPLE}" ]]; then
@@ -85,20 +83,14 @@ load_ips(){
 
 # ---------------------------------------------------------------------------
 # Credentials
-# Passwords are stored internally as raw strings (read -r).
-# When passed to sshpass, they are written to a temp file (fd) to avoid
-# shell word-splitting and to handle any special characters safely.
-# Collected ONCE and reused for all nodes.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
-  # Skip if already set (e.g. re-sourcing the lib)
   if [[ -n "${NSX_PASS:-}" ]]; then
     log "Admin credentials already loaded, skipping prompt."
     return 0
   fi
   read -rp  "Admin username [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  # IFS= read -r preserves every character including backslashes and special chars
   IFS= read -rsp "Admin password (all special characters accepted): " NSX_PASS; echo
   export NSX_USER NSX_PASS
   log "Credentials collected for user '${NSX_USER}'. Will be reused for all nodes."
@@ -120,18 +112,15 @@ clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH helper: write password to a private temp file, pass via SSHPASS env var.
-# This avoids exposing the password in process args and handles any char safely.
+# SSH helper: escreve senha em arquivo temp privado (600), passa via SSHPASS.
+# Nunca expõe senha em args de processo.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
-  # $1 = password variable name (NSX_PASS or ROOT_PASS)
-  # remaining args = ssh command
   local _passvar="$1"; shift
   local _pass="${!_passvar}"
   local _tmpfile
   _tmpfile="$(mktemp -t sshpass_XXXXXX)"
   chmod 600 "${_tmpfile}"
-  # Write raw password to file — no shell interpretation
   printf '%s' "${_pass}" > "${_tmpfile}"
   SSHPASS="$(cat "${_tmpfile}")" sshpass -e "$@"
   local _rc=$?
@@ -141,6 +130,9 @@ _sshpass_safe(){
 
 # ---------------------------------------------------------------------------
 # SSH Functions
+# FIX v3.13: stderr do cliente SSH (ex: warnings de ssh_config) é
+# redirecionado para /dev/null para não contaminar o stdout capturado
+# pelos callers. Apenas o stdout do comando remoto é retornado.
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -150,13 +142,13 @@ ssh_admin(){
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
         -o BatchMode=yes \
-        "admin@${ip}" "$@"
+        "admin@${ip}" "$@" 2>/dev/null
   else
     _sshpass_safe NSX_PASS ssh \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
-        "${NSX_USER}@${ip}" "$@"
+        "${NSX_USER}@${ip}" "$@" 2>/dev/null
   fi
 }
 
@@ -168,18 +160,18 @@ ssh_root(){
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
         -o BatchMode=yes \
-        "root@${ip}" "$@"
+        "root@${ip}" "$@" 2>/dev/null
   else
     _sshpass_safe ROOT_PASS ssh \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
-        "root@${ip}" "$@"
+        "root@${ip}" "$@" 2>/dev/null
   fi
 }
 
-admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
-root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
+admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd"; }
+root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd"; }
 
 # ---------------------------------------------------------------------------
 # Root SSH Control
@@ -214,4 +206,17 @@ check_support_bundle(){
     "find /var/log /storage /tmp -maxdepth 3 \( -name '*support*bundle*' -o -name '*.tgz' -o -name '*.tar.gz' \) -type f 2>/dev/null | head -20")"
   out_root="$(root_cmd "$ip" "getent passwd root >/dev/null 2>&1; echo ROOT_OK")"
   printf '%s\n----FILES----\n%s\n----ROOT----\n%s\n' "$out_log" "$out_files" "$out_root"
+}
+
+# ---------------------------------------------------------------------------
+# Bundle list helper
+# FIX v3.13: filtra output do ls remoto aceitando APENAS nomes no padrão
+# sb_*.tgz — descarta qualquer linha de stderr ou arquivo não relacionado
+# que possa ter vazado para o stdout (ex: warnings do ssh_config).
+# ---------------------------------------------------------------------------
+list_remote_bundles(){
+  # Retorna apenas linhas no formato sb_*.tgz, uma por linha
+  local ip="$1"
+  root_cmd "$ip" "ls /var/vmware/nsx/file-store/ 2>/dev/null" \
+    | grep -E '^sb_.*\.tgz$' || true
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  —  v2.0
+# deploy_nsx_sb_check.sh  —  v3.13
 # Deploy local do kit NSX Edge Automation - Support Bundle
 # Estrutura: lib/ + automations/support_bundle/
 #
@@ -140,7 +140,7 @@ README
 # ===========================================================================
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh
+# lib/common.sh — v3.13
 # Shared library for all NSX Edge automations.
 # Provides: SSH access (admin + root), IP loading, credential handling.
 #
@@ -188,11 +188,12 @@ need_cmd(){
 # ---------------------------------------------------------------------------
 collect_ips(){
   if [[ -f "${EDGE_EXAMPLE}" ]]; then
-    echo "  Template: ${EDGE_EXAMPLE}"
-    echo "  Ou cole os IPs abaixo."
+    echo "  Template available: ${EDGE_EXAMPLE}"
+    echo "  Copy with: cp edge_nodes.example edge_nodes.txt, then edit."
+    echo "  Or paste IPs directly below."
   fi
   echo ""
-  echo "Cole os IPs dos Edge Nodes, um por linha. Linha vazia para finalizar:"
+  echo "Paste Edge Node IPs, one per line. Empty line to finish:"
   : > "${EDGE_FILE}"
   while IFS= read -r line; do
     [[ -z "$line" ]] && break
@@ -200,63 +201,59 @@ collect_ips(){
     if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "$line" >> "${EDGE_FILE}"
     else
-      log_warn "Entrada inválida ignorada: ${line}"
+      log_warn "Skipping invalid entry: ${line}"
     fi
   done
   local count
   count=$(wc -l < "${EDGE_FILE}" | tr -d ' ')
-  log "${count} IP(s) salvos em ${EDGE_FILE}"
+  log "${count} IP(s) saved to ${EDGE_FILE}"
 }
 
 load_ips(){
   if [[ ! -s "${EDGE_FILE}" ]]; then
-    log_warn "${EDGE_FILE} não encontrado ou vazio."
+    log_warn "${EDGE_FILE} not found or empty."
     collect_ips
   fi
   mapfile -t EDGE_IPS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "${EDGE_FILE}" 2>/dev/null || true)
   if [[ ${#EDGE_IPS[@]} -eq 0 ]]; then
-    log_err "Nenhum IP válido em ${EDGE_FILE}."
+    log_err "No valid IPs found in ${EDGE_FILE}."
     exit 1
   fi
-  log "${#EDGE_IPS[@]} Edge Node(s) carregados: ${EDGE_IPS[*]}"
+  log "Loaded ${#EDGE_IPS[@]} Edge Node(s): ${EDGE_IPS[*]}"
 }
 
 # ---------------------------------------------------------------------------
 # Credentials
-# Coletadas UMA VEZ e reutilizadas para todos os nós.
-# IFS= read -r preserva qualquer caractere especial (/, \, ', ", etc.)
-# Passadas ao sshpass via arquivo temporário privado (600), nunca via args.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
-    log "Credenciais admin já carregadas, pulando prompt."
+    log "Admin credentials already loaded, skipping prompt."
     return 0
   fi
-  read -rp  "Usuário admin [admin]: " NSX_USER
+  read -rp  "Admin username [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  IFS= read -rsp "Senha admin (aceita qualquer caractere especial): " NSX_PASS; echo
+  IFS= read -rsp "Admin password (all special characters accepted): " NSX_PASS; echo
   export NSX_USER NSX_PASS
-  log "Credenciais coletadas para '${NSX_USER}'. Serão reutilizadas em todos os nós."
+  log "Credentials collected for user '${NSX_USER}'. Will be reused for all nodes."
 }
 
 ask_root_creds(){
   if [[ -n "${ROOT_PASS:-}" ]]; then
-    log "Credenciais root já carregadas, pulando prompt."
+    log "Root credentials already loaded, skipping prompt."
     return 0
   fi
-  IFS= read -rsp "Senha root (aceita qualquer caractere especial): " ROOT_PASS; echo
+  IFS= read -rsp "Root password (all special characters accepted): " ROOT_PASS; echo
   export ROOT_PASS
-  log "Credenciais root coletadas. Serão reutilizadas em todos os nós."
+  log "Root credentials collected. Will be reused for all nodes."
 }
 
 clear_creds(){
   unset NSX_PASS ROOT_PASS NSX_USER 2>/dev/null || true
-  log "Credenciais removidas da memória."
+  log "Credentials cleared from memory."
 }
 
 # ---------------------------------------------------------------------------
-# SSH helper seguro: escreve a senha em arquivo temporário (600) e usa
-# SSHPASS env var — nunca expõe a senha em argumentos de processo.
+# SSH helper: escreve senha em arquivo temp privado (600), passa via SSHPASS.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
   local _passvar="$1"; shift
@@ -273,6 +270,9 @@ _sshpass_safe(){
 
 # ---------------------------------------------------------------------------
 # SSH Functions
+# FIX v3.13: stderr do cliente SSH suprimido com 2>/dev/null para evitar
+# que warnings locais (ex: /etc/ssh/ssh_config gssapiauthentication)
+# contaminem o stdout capturado pelos callers.
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -282,13 +282,13 @@ ssh_admin(){
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
         -o BatchMode=yes \
-        "admin@${ip}" "$@"
+        "admin@${ip}" "$@" 2>/dev/null
   else
     _sshpass_safe NSX_PASS ssh \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
-        "${NSX_USER}@${ip}" "$@"
+        "${NSX_USER}@${ip}" "$@" 2>/dev/null
   fi
 }
 
@@ -300,31 +300,31 @@ ssh_root(){
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
         -o BatchMode=yes \
-        "root@${ip}" "$@"
+        "root@${ip}" "$@" 2>/dev/null
   else
     _sshpass_safe ROOT_PASS ssh \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
-        "root@${ip}" "$@"
+        "root@${ip}" "$@" 2>/dev/null
   fi
 }
 
-admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
-root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
+admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd"; }
+root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd"; }
 
 # ---------------------------------------------------------------------------
 # Root SSH Control
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
-  log "${ip}: habilitando root SSH..."
+  log "${ip}: enabling root SSH..."
   admin_cmd "$ip" 'set service ssh enabled; start service ssh; set service ssh root-login enabled' || true
 }
 
 disable_root_ssh(){
   local ip="$1"
-  log "${ip}: desabilitando root SSH..."
+  log "${ip}: disabling root SSH..."
   admin_cmd "$ip" 'set service ssh root-login disabled' || true
 }
 
@@ -346,6 +346,18 @@ check_support_bundle(){
     "find /var/log /storage /tmp -maxdepth 3 \( -name '*support*bundle*' -o -name '*.tgz' -o -name '*.tar.gz' \) -type f 2>/dev/null | head -20")"
   out_root="$(root_cmd "$ip" "getent passwd root >/dev/null 2>&1; echo ROOT_OK")"
   printf '%s\n----FILES----\n%s\n----ROOT----\n%s\n' "$out_log" "$out_files" "$out_root"
+}
+
+# ---------------------------------------------------------------------------
+# Bundle list helper
+# FIX v3.13: aceita APENAS nomes no padrão sb_*.tgz — descarta qualquer
+# linha de stderr ou arquivo não relacionado que possa ter vazado para o
+# stdout (ex: warnings do ssh_config, arquivos .pcap, .py, .sh).
+# ---------------------------------------------------------------------------
+list_remote_bundles(){
+  local ip="$1"
+  root_cmd "$ip" "ls /var/vmware/nsx/file-store/ 2>/dev/null" \
+    | grep -E '^sb_.*\.tgz$' || true
 }
 COMMON
 chmod +x "${LIB_DIR}/common.sh"
@@ -580,7 +592,6 @@ auto_clear_bg(){
 }
 if [[ -n "${NSX_PASS:-}" ]]; then
   umask 077
-  # Usa printf %q para serializar com segurança (escapa chars especiais)
   printf 'export NSX_USER=%q\nexport NSX_PASS=%q\nexport ROOT_PASS=%q\n' \
     "${NSX_USER}" "${NSX_PASS}" "${ROOT_PASS:-}" > "${RUN_DIR}/session.env"
   auto_clear_bg "$EXPIRY_EPOCH"
@@ -796,18 +807,19 @@ clear_creds
 
 ### 4. Funções disponíveis de lib/common.sh
 
-| Função                | Descrição                                           |
-|-----------------------|-----------------------------------------------------|
-| `load_ips`            | Carrega edge_nodes.txt, solicita preenchimento      |
-| `ask_admin_creds`     | Coleta usuário e senha admin (uma vez)              |
-| `ask_root_creds`      | Coleta senha root (uma vez)                         |
-| `clear_creds`         | Remove variáveis de credencial da memória           |
-| `admin_cmd ip cmd`    | Executa comando NSX CLI como admin                  |
-| `root_cmd ip cmd`     | Executa comando Linux como root                     |
-| `enable_root_ssh ip`  | Habilita login root SSH via CLI admin               |
-| `disable_root_ssh ip` | Desabilita login root SSH via CLI admin             |
-| `log / log_ok / log_warn / log_err` | Log com timestamp                   |
-| `need_cmd binário`    | Encerra se binário não encontrado no PATH           |
+| Função                    | Descrição                                           |
+|---------------------------|-----------------------------------------------------|
+| `load_ips`                | Carrega edge_nodes.txt, solicita preenchimento      |
+| `ask_admin_creds`         | Coleta usuário e senha admin (uma vez)              |
+| `ask_root_creds`          | Coleta senha root (uma vez)                         |
+| `clear_creds`             | Remove variáveis de credencial da memória           |
+| `admin_cmd ip cmd`        | Executa comando NSX CLI como admin                  |
+| `root_cmd ip cmd`         | Executa comando Linux como root                     |
+| `enable_root_ssh ip`      | Habilita login root SSH via CLI admin               |
+| `disable_root_ssh ip`     | Desabilita login root SSH via CLI admin             |
+| `list_remote_bundles ip`  | Lista apenas arquivos sb_*.tgz no file-store        |
+| `log / log_ok / log_warn / log_err` | Log com timestamp                       |
+| `need_cmd binário`        | Encerra se binário não encontrado no PATH           |
 CONTRIBDOC
 
 # ===========================================================================
@@ -826,7 +838,7 @@ IPEX
 # ===========================================================================
 echo ""
 echo "========================================================"
-echo " Kit NSX Edge Automation instalado com sucesso! v2.0"
+echo " Kit NSX Edge Automation instalado com sucesso! v3.13"
 echo "========================================================"
 echo ""
 echo "  Localização : ${BASE_DIR}"
