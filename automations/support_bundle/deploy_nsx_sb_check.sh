@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.11
+# deploy_nsx_sb_check.sh  v3.12
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
 #   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
+#
+# CHANGELOG v3.12:
+#   - check_bundle_status: detecção de processo usa root_cmd (stderr descartado)
+#     em vez de root_cmd_tty (stderr misturado ao stdout).
+#     Elimina falso positivo "bundle em andamento" causado pelo aviso do cliente
+#     SSH: /etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
+#     que aparecia como conteúdo de $proc_out e disparava BUNDLE_STATUS=inprogress
+#     mesmo quando nenhum processo de bundle estava rodando.
 #
 # CHANGELOG v3.11:
 #   - _BUNDLE_GREP simplificado para '\.tgz$' (ERE com alternância causava
@@ -31,7 +39,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.11"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.12"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -66,11 +74,21 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.11
+# lib/common.sh  — v3.12
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.11
+# lib/common.sh  — v3.12
+#
+# NOVO v3.12:
+#   check_bundle_status: detecção de processo em andamento passou a usar
+#   root_cmd (stderr=2>/dev/null) em vez de root_cmd_tty (stderr=2>&1).
+#   O aviso do cliente SSH local:
+#     /etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
+#   era capturado em $proc_out via 2>&1 e tornava a variável não-vazia,
+#   disparando BUNDLE_STATUS=inprogress mesmo sem processo de bundle ativo.
+#   Com root_cmd o stderr local é descartado e $proc_out reflete apenas
+#   a saída real do comando remoto.
 #
 # NOVO v3.11:
 #   _BUNDLE_GREP simplificado para '\.tgz$':
@@ -511,8 +529,11 @@ check_bundle_status(){
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
   list_bundle_dir "$ip"
 
+  # v3.12: root_cmd (stderr=2>/dev/null) em vez de root_cmd_tty (stderr=2>&1)
+  # Evita que avisos do cliente SSH local (ex: "Unsupported option gssapiauthentication")
+  # contaminem $proc_out e causem falso positivo de "bundle em andamento".
   local proc_out
-  proc_out="$(root_cmd_tty "$ip" \
+  proc_out="$(root_cmd "$ip" \
     "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
   if [[ -n "$proc_out" ]]; then
     log_warn "${ip}: geração de bundle em andamento (processo detectado)."
@@ -764,11 +785,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.11
+# nsx_sb_main.sh  — v3.12
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.11
+# nsx_sb_main.sh  — v3.12
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -984,7 +1005,23 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.11
+# NSX Edge Automation — Manual de Uso  v3.12
+
+## Correções v3.12
+
+| Item corrigido | Antes (v3.11) | Depois (v3.12) |
+|---|---|---|
+| `check_bundle_status` — detecção de processo | `root_cmd_tty` (stderr=2>&1, aviso SSH contaminava `$proc_out`) | `root_cmd` (stderr=2>/dev/null, somente stdout do processo remoto) |
+
+### Sintoma eliminado
+
+```
+[WARN] 10.x.x.x: geração de bundle em andamento (processo detectado).
+       processo: /etc/ssh/ssh_config line 59: Unsupported option "gssapiauthentication"
+```
+
+O aviso era gerado pelo **cliente SSH local** (não pelo node) e capturado via `2>&1`,
+tornando `$proc_out` não-vazio e disparando `BUNDLE_STATUS=inprogress` indevidamente.
 
 ## Correções v3.11
 
@@ -995,24 +1032,6 @@ cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
 | `_cmd_preview` em `ask_bundle_options` | `_cmd_preview+=" ${SB_EXTRA}"` | `if/then` |
 | `nsx_cmd` em `request_support_bundle` | `nsx_cmd+=" ${sb_extra}"` | `if/then` |
 | `disable_root_ssh` | sem `return 0` explícito | `return 0` ao final |
-
-## Novo em v3.10 — Menu de opções do support-bundle
-
-Após a coleta de credenciais, o script exibe um menu com **timeout de 10 segundos**.
-Sem resposta, segue automaticamente com os valores padrão.
-
-### Opções de modo
-
-| Escolha | Opção | Comando gerado |
-|---|---|---|
-| `1` ou Enter | Padrão | `get support-bundle file <nome> log-age <N>` |
-| `2` | all | `get support-bundle file <nome> all log-age <N>` |
-| `3` | all remove-core | `get support-bundle file <nome> all remove-core-file log-age <N>` |
-
-### log-age
-
-Valores aceitos: `1` a `30` (dias). Padrão: `1`.
-Após escolher o modo, o script pergunta o log-age com o mesmo timeout de 10s.
 
 ## Deploy
 
@@ -1044,14 +1063,13 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.11"
+echo "  Deploy concluído! v3.12"
 echo "================================================================"
 echo ""
-echo "  Correções v3.11:"
-echo "    _BUNDLE_GREP: ERE simplificado para '\.tgz$'"
-echo "    _list_bundles*: grep sem -E"
-echo "    _cmd_preview / nsx_cmd: if/then em vez de +="
-echo "    disable_root_ssh: return 0 explícito"
+echo "  Correção v3.12:"
+echo "    check_bundle_status: root_cmd em vez de root_cmd_tty"
+echo "    Elimina falso positivo de 'bundle em andamento' causado pelo"
+echo "    aviso do cliente SSH (gssapiauthentication) contaminando proc_out"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
