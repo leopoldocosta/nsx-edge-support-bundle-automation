@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.10
+# nsx_sb_main.sh  — v3.10.1
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -21,7 +21,6 @@ STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
 declare -a REPORT_LINES=()
-# FIX v3.9 — array associativo para decisão de ação na PHASE 1.
 declare -A NODE_ACAO=()
 
 if [[ "$CLEAN_ALL" == true ]]; then
@@ -34,7 +33,7 @@ if [[ "$CLEAN_ALL" == true ]]; then
     fi
     list_bundle_dir "$ip"
     delete_all_bundles "$ip"
-    disable_root_ssh "$ip"
+    disable_root_ssh "$ip" || true   # FIX v3.10.1: NSX pode retornar != 0
     printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" \
       | tee -a "$RUN_LOG" >> "$STATUS_CSV"
   done
