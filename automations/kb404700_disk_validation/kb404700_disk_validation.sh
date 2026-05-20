@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.5
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.6
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
 #   1. Admin login  → get uptime + version  (exact output line printed to log)
 #   2. Admin        → enable root SSH
-#   3. Root login   → df -h  (root partition identified by mount point '/', not device name)
-#   4. Root login   → du -xah --time --max-depth=3 /var/lib/docker/ (exact overlay2 line)
-#   5. Admin        → disable root SSH
-#   6. Final report with per-node detail + ACTION REQUIRED summary list
-#      (summary includes root%, overlay2 size columns)
+#   3. Root login   → hostname
+#   4. Root login   → df -h  (root partition identified by mount point '/')
+#   5. Root login   → du -xah --time --max-depth=3 /var/lib/docker/
+#   6. Admin        → disable root SSH
+#   7. Final report: per-node detail + ACTION REQUIRED summary table
+#      (columns: #, Hostname, IP, Uptime(d), Version, Root%, overlay2)
 #
 # FIX v1.4: exec > >(tee) is started AFTER all interactive prompts.
 # All read calls use </dev/tty explicitly as an extra safety net.
 #
 # Usage:
 #   bash kb404700_disk_validation.sh
-#   IPs are entered interactively at startup — no file editing needed.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -34,10 +34,12 @@ need_cmd sort
 need_cmd grep
 
 # ---------------------------------------------------------------------------
-# Associative arrays for per-node results
+# Associative arrays
 # ---------------------------------------------------------------------------
 declare -A NODE_UPTIME
+declare -A NODE_UPTIME_DAYS          # numeric days extracted from uptime string
 declare -A NODE_VERSION
+declare -A NODE_VERSION_SHORT        # x.y.z.w extracted from version string
 declare -A NODE_ROOT_DEVICE
 declare -A NODE_ROOT_PART_LINE
 declare -A NODE_ROOT_PART_SIZE
@@ -103,6 +105,30 @@ ask_root_creds(){
 }
 
 # ---------------------------------------------------------------------------
+# parse_uptime_days  "19:49:19 up 78 days, 17:32, ..."
+# Extracts the numeric day count. Returns "N/A" if not found.
+# Handles both "X day," and "X days," (singular/plural).
+# ---------------------------------------------------------------------------
+parse_uptime_days(){
+  local raw="$1"
+  local days
+  days="$(echo "${raw}" | grep -oP '(?<=up )\d+(?= day)' || true)"
+  echo "${days:-N/A}"
+}
+
+# ---------------------------------------------------------------------------
+# parse_version_short  "VMware NSX Software, Version 4.2.1.3.0.24533894"
+# Extracts the first x.y.z.w quad (4 numeric groups) from the string.
+# Returns "N/A" if not found.
+# ---------------------------------------------------------------------------
+parse_version_short(){
+  local raw="$1"
+  local ver
+  ver="$(echo "${raw}" | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)"
+  echo "${ver:-N/A}"
+}
+
+# ---------------------------------------------------------------------------
 # collect_node_info IP
 # ---------------------------------------------------------------------------
 collect_node_info(){
@@ -124,6 +150,9 @@ collect_node_info(){
     return 1
   fi
 
+  NODE_UPTIME_DAYS["${ip}"]="$(parse_uptime_days  "${NODE_UPTIME[${ip}]}")"
+  NODE_VERSION_SHORT["${ip}"]="$(parse_version_short "${NODE_VERSION[${ip}]}")"
+
   log_ok "${ip}: [uptime]   >> ${NODE_UPTIME[${ip}]}"
   log_ok "${ip}: [version]  >> ${NODE_VERSION[${ip}]}"
 
@@ -131,13 +160,13 @@ collect_node_info(){
   enable_root_ssh "${ip}"
   sleep 2
 
-  # --- 3a. Root: hostname --------------------------------------------------
+  # --- 3. Root: hostname ---------------------------------------------------
   local raw_hostname
   raw_hostname="$(root_cmd "${ip}" 'hostname' 2>/dev/null || true)"
   NODE_HOSTNAME["${ip}"]="$(echo "${raw_hostname}" | grep -v '^$' | head -1 | xargs)"
   NODE_HOSTNAME["${ip}"]="${NODE_HOSTNAME[${ip}]:-${ip}}"
 
-  # --- 3b. Root: df -h (identify root partition by mount point '/') --------
+  # --- 4. Root: df -h ------------------------------------------------------
   log "${ip}: running 'df -h' via root..."
   local df_output df_header root_line
   df_output="$(root_cmd "${ip}" 'df -h' 2>/dev/null || true)"
@@ -186,7 +215,7 @@ collect_node_info(){
     log_warn "${ip}: root partition (mount '/') not found in df output."
   fi
 
-  # --- 4. Root: du /var/lib/docker/ ----------------------------------------
+  # --- 5. Root: du /var/lib/docker/ ----------------------------------------
   log "${ip}: running 'du -xah --time --max-depth=3 /var/lib/docker/' via root (may take a while)..."
   local du_output docker_total_line overlay2_line
   du_output="$(root_cmd "${ip}" \
@@ -222,7 +251,7 @@ collect_node_info(){
     log_warn "${ip}: could not determine /var/lib/docker/overlay2 size (no G-sized entries)."
   fi
 
-  # --- 5. Admin: disable root SSH -----------------------------------------
+  # --- 6. Admin: disable root SSH -----------------------------------------
   disable_root_ssh "${ip}" || true
   log_ok "${ip}: data collection complete."
 }
@@ -232,8 +261,8 @@ collect_node_info(){
 # ---------------------------------------------------------------------------
 print_report(){
   local sep thin_sep
-  sep="$(printf '=%.0s' {1..80})"
-  thin_sep="$(printf -- '-%.0s' {1..80})"
+  sep="$(printf '=%.0s' {1..96})"
+  thin_sep="$(printf -- '-%.0s' {1..96})"
 
   local action_nodes=()
 
@@ -294,7 +323,7 @@ print_report(){
 
     # -----------------------------------------------------------------
     # ACTION REQUIRED summary table
-    # Columns: #  Hostname  IP  Root%  overlay2
+    # Columns: #  Hostname  IP  Uptime(d)  Version  Root%  overlay2
     # -----------------------------------------------------------------
     echo "${sep}"
     printf '  NODES REQUIRING ACTION\n'
@@ -303,16 +332,18 @@ print_report(){
     if [[ ${#action_nodes[@]} -eq 0 ]]; then
       printf '  All nodes are OK. No action required.\n'
     else
-      printf '  %-4s  %-28s  %-17s  %-7s  %s\n' \
-        "#" "Hostname" "IP" "Root%" "overlay2"
-      printf '  %-4s  %-28s  %-17s  %-7s  %s\n' \
-        "----" "----------------------------" "-----------------" "-------" "--------"
+      printf '  %-4s  %-26s  %-17s  %-10s  %-13s  %-7s  %s\n' \
+        "#" "Hostname" "IP" "Uptime(d)" "Version" "Root%" "overlay2"
+      printf '  %-4s  %-26s  %-17s  %-10s  %-13s  %-7s  %s\n' \
+        "----" "--------------------------" "-----------------" "----------" "-------------" "-------" "--------"
       local idx=1
       for aip in "${action_nodes[@]}"; do
-        printf '  %-4s  %-28s  %-17s  %-7s  %s\n' \
+        printf '  %-4s  %-26s  %-17s  %-10s  %-13s  %-7s  %s\n' \
           "${idx}." \
           "${NODE_HOSTNAME[${aip}]:-N/A}" \
           "${aip}" \
+          "${NODE_UPTIME_DAYS[${aip}]:-N/A}" \
+          "${NODE_VERSION_SHORT[${aip}]:-N/A}" \
           "${NODE_ROOT_PART_PCT[${aip}]:-N/A}" \
           "${NODE_OVERLAY2_SIZE[${aip}]:-N/A}"
         (( idx++ ))
@@ -330,9 +361,6 @@ print_report(){
 
 # ---------------------------------------------------------------------------
 # MAIN
-# collect_ips_interactive and ask_*_creds run BEFORE exec > >(tee) so that
-# all interactive prompts go directly to /dev/tty without interference.
-# The tee redirect is started only after credentials are in memory.
 # ---------------------------------------------------------------------------
 main(){
   collect_ips_interactive
