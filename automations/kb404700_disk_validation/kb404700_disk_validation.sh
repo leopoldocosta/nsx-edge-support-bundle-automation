@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.8
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.9
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
@@ -11,11 +11,12 @@
 #   5. Root login   → du -xah --time --max-depth=3 /var/lib/docker/
 #   6. Admin        → disable root SSH
 #   7. Final report: per-node detail + ACTION REQUIRED summary table
+#   8. Ask user whether to clear credentials from environment.
+#      Default: Yes after 30 seconds with no response.
 #
 # IP LIST PERSISTENCE (v1.7+):
 #   - edge_nodes exists  → loaded automatically, no prompt.
 #   - edge_nodes missing → interactive prompt runs and saves the file.
-#   - To change the list: edit edge_nodes directly, or delete it to re-prompt.
 #
 # FIX v1.4: exec > >(tee) started AFTER all interactive prompts.
 # All read calls use </dev/tty explicitly.
@@ -97,7 +98,7 @@ load_or_prompt_ips(){
 }
 
 # ---------------------------------------------------------------------------
-# Credential overrides bound to /dev/tty
+# Credential helpers
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
@@ -121,8 +122,6 @@ ask_root_creds(){
   log "Root credentials collected."
 }
 
-# Re-prompts admin credentials regardless of current state.
-# Used after a failed admin SSH attempt.
 reprompt_admin_creds(){
   log_warn "Re-prompting admin credentials..."
   unset NSX_PASS NSX_USER
@@ -134,10 +133,34 @@ reprompt_admin_creds(){
 }
 
 # ---------------------------------------------------------------------------
+# confirm_clear_creds
+# Asks whether to clear NSX_PASS, NSX_USER, ROOT_PASS from the environment.
+# Default answer is YES after 30 seconds of no input.
+# ---------------------------------------------------------------------------
+confirm_clear_creds(){
+  local answer
+  printf '\n' >/dev/tty
+  # Use read -t for timeout; -t is supported in bash for /dev/tty reads.
+  if IFS= read -r -t 30 -p 'Clear credentials from environment? [Y/n] (auto-yes in 30s): ' answer </dev/tty; then
+    printf '\n' >/dev/tty
+  else
+    printf '\n' >/dev/tty
+    log "No response — clearing credentials automatically."
+    answer="y"
+  fi
+  case "${answer,,}" in
+    n|no)
+      log "Credentials retained in environment."
+      ;;
+    *)
+      clear_creds
+      log "Credentials cleared."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # try_admin_ssh IP
-# Attempts admin SSH (get uptime + version).
-# Returns 0 on success, 1 on failure.
-# Populates NODE_UPTIME and NODE_VERSION on success.
 # ---------------------------------------------------------------------------
 try_admin_ssh(){
   local ip="$1"
@@ -148,9 +171,7 @@ try_admin_ssh(){
   NODE_UPTIME["${ip}"]="$(echo "${raw_uptime}"  | grep -v '^$' | head -1 | xargs)"
   NODE_VERSION["${ip}"]="$(echo "${raw_version}" | grep -v '^$' | head -1 | xargs)"
 
-  if [[ -z "${NODE_UPTIME[${ip}]}" && -z "${NODE_VERSION[${ip}]}" ]]; then
-    return 1
-  fi
+  [[ -z "${NODE_UPTIME[${ip}]}" && -z "${NODE_VERSION[${ip}]}" ]] && return 1
   return 0
 }
 
@@ -158,13 +179,11 @@ try_admin_ssh(){
 # Parsers
 # ---------------------------------------------------------------------------
 parse_uptime_days(){
-  local raw="$1"
-  echo "$(echo "${raw}" | grep -oP '(?<=up )\d+(?= day)' || true)"
+  echo "$(echo "$1" | grep -oP '(?<=up )\d+(?= day)' || true)"
 }
 
 parse_version_short(){
-  local raw="$1"
-  echo "$(echo "${raw}" | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)"
+  echo "$(echo "$1" | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)"
 }
 
 # ---------------------------------------------------------------------------
@@ -418,8 +437,9 @@ main(){
   [[ ${#failed_nodes[@]} -gt 0 ]] && log_warn "Nodes with errors: ${failed_nodes[*]}"
 
   print_report
-  clear_creds
+
   log "=== KB404700 Disk Validation — DONE ==="
+  confirm_clear_creds
 }
 
 main "$@"
