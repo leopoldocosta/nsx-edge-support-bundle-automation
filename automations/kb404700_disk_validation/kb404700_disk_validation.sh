@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.7
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.8
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
 #   1. Admin login  → get uptime + version
+#      On failure: clear admin creds, re-prompt once. If still fails: skip node.
 #   2. Admin        → enable root SSH
 #   3. Root login   → hostname
 #   4. Root login   → df -h  (root partition by mount point '/')
@@ -11,10 +12,9 @@
 #   6. Admin        → disable root SSH
 #   7. Final report: per-node detail + ACTION REQUIRED summary table
 #
-# IP LIST PERSISTENCE (v1.7):
-#   - If edge_nodes exists alongside the script → loaded automatically, no prompt.
-#   - If edge_nodes does NOT exist → interactive prompt runs and the result
-#     is saved to edge_nodes for all future runs.
+# IP LIST PERSISTENCE (v1.7+):
+#   - edge_nodes exists  → loaded automatically, no prompt.
+#   - edge_nodes missing → interactive prompt runs and saves the file.
 #   - To change the list: edit edge_nodes directly, or delete it to re-prompt.
 #
 # FIX v1.4: exec > >(tee) started AFTER all interactive prompts.
@@ -25,9 +25,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
-
-# EDGE_FILE is already defined by common.sh as ${AUTO_DIR}/edge_nodes
-# (same directory as this script, so it resolves correctly)
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -62,8 +59,6 @@ declare -A NODE_HOSTNAME
 
 # ---------------------------------------------------------------------------
 # collect_ips_interactive
-# Called only when edge_nodes does not exist.
-# Saves the result to edge_nodes so the next run skips the prompt entirely.
 # ---------------------------------------------------------------------------
 collect_ips_interactive(){
   printf '\nNo edge_nodes file found.\n' >/dev/tty
@@ -90,8 +85,6 @@ collect_ips_interactive(){
 
 # ---------------------------------------------------------------------------
 # load_or_prompt_ips
-# If edge_nodes exists: load it silently.
-# If not: run interactive collection and save.
 # ---------------------------------------------------------------------------
 load_or_prompt_ips(){
   if [[ -f "${EDGE_FILE}" && -s "${EDGE_FILE}" ]]; then
@@ -128,21 +121,50 @@ ask_root_creds(){
   log "Root credentials collected."
 }
 
+# Re-prompts admin credentials regardless of current state.
+# Used after a failed admin SSH attempt.
+reprompt_admin_creds(){
+  log_warn "Re-prompting admin credentials..."
+  unset NSX_PASS NSX_USER
+  IFS= read -rp 'Admin username [admin]: ' NSX_USER </dev/tty
+  NSX_USER="${NSX_USER:-admin}"
+  IFS= read -rsp 'Admin password: ' NSX_PASS </dev/tty; printf '\n' >/dev/tty
+  export NSX_USER NSX_PASS
+  log "Admin credentials updated for user '${NSX_USER}'."
+}
+
+# ---------------------------------------------------------------------------
+# try_admin_ssh IP
+# Attempts admin SSH (get uptime + version).
+# Returns 0 on success, 1 on failure.
+# Populates NODE_UPTIME and NODE_VERSION on success.
+# ---------------------------------------------------------------------------
+try_admin_ssh(){
+  local ip="$1"
+  local raw_uptime raw_version
+  raw_uptime="$(admin_cmd "${ip}" 'get uptime'  2>/dev/null || true)"
+  raw_version="$(admin_cmd "${ip}" 'get version' 2>/dev/null || true)"
+
+  NODE_UPTIME["${ip}"]="$(echo "${raw_uptime}"  | grep -v '^$' | head -1 | xargs)"
+  NODE_VERSION["${ip}"]="$(echo "${raw_version}" | grep -v '^$' | head -1 | xargs)"
+
+  if [[ -z "${NODE_UPTIME[${ip}]}" && -z "${NODE_VERSION[${ip}]}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
 parse_uptime_days(){
   local raw="$1"
-  local days
-  days="$(echo "${raw}" | grep -oP '(?<=up )\d+(?= day)' || true)"
-  echo "${days:-N/A}"
+  echo "$(echo "${raw}" | grep -oP '(?<=up )\d+(?= day)' || true)"
 }
 
 parse_version_short(){
   local raw="$1"
-  local ver
-  ver="$(echo "${raw}" | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)"
-  echo "${ver:-N/A}"
+  echo "$(echo "${raw}" | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)"
 }
 
 # ---------------------------------------------------------------------------
@@ -152,34 +174,38 @@ collect_node_info(){
   local ip="$1"
   NODE_ERROR["${ip}"]=""
 
+  # --- 1. Admin SSH: uptime + version (with one re-prompt on failure) -----
   log "${ip}: collecting uptime and version via admin..."
-  local raw_uptime raw_version
-  raw_uptime="$(admin_cmd "${ip}" 'get uptime'  2>/dev/null || true)"
-  raw_version="$(admin_cmd "${ip}" 'get version' 2>/dev/null || true)"
-
-  NODE_UPTIME["${ip}"]="$(echo "${raw_uptime}"  | grep -v '^$' | head -1 | xargs)"
-  NODE_VERSION["${ip}"]="$(echo "${raw_version}" | grep -v '^$' | head -1 | xargs)"
-
-  if [[ -z "${NODE_UPTIME[${ip}]}" && -z "${NODE_VERSION[${ip}]}" ]]; then
-    NODE_ERROR["${ip}"]="Admin SSH failed — node unreachable or bad credentials."
-    log_warn "${ip}: admin SSH failed, skipping node."
-    return 1
+  if ! try_admin_ssh "${ip}"; then
+    log_warn "${ip}: admin SSH failed."
+    reprompt_admin_creds
+    log "${ip}: retrying admin SSH with new credentials..."
+    if ! try_admin_ssh "${ip}"; then
+      NODE_ERROR["${ip}"]="Admin SSH failed after credential re-prompt."
+      log_warn "${ip}: admin SSH failed again — skipping node."
+      return 1
+    fi
   fi
 
   NODE_UPTIME_DAYS["${ip}"]="$(parse_uptime_days  "${NODE_UPTIME[${ip}]}")"
   NODE_VERSION_SHORT["${ip}"]="$(parse_version_short "${NODE_VERSION[${ip}]}")"
+  NODE_UPTIME_DAYS["${ip}"]="${NODE_UPTIME_DAYS[${ip}]:-N/A}"
+  NODE_VERSION_SHORT["${ip}"]="${NODE_VERSION_SHORT[${ip}]:-N/A}"
 
   log_ok "${ip}: [uptime]   >> ${NODE_UPTIME[${ip}]}"
   log_ok "${ip}: [version]  >> ${NODE_VERSION[${ip}]}"
 
+  # --- 2. Admin: enable root SSH ------------------------------------------
   enable_root_ssh "${ip}"
   sleep 2
 
+  # --- 3. Root: hostname ---------------------------------------------------
   local raw_hostname
   raw_hostname="$(root_cmd "${ip}" 'hostname' 2>/dev/null || true)"
   NODE_HOSTNAME["${ip}"]="$(echo "${raw_hostname}" | grep -v '^$' | head -1 | xargs)"
   NODE_HOSTNAME["${ip}"]="${NODE_HOSTNAME[${ip}]:-${ip}}"
 
+  # --- 4. Root: df -h ------------------------------------------------------
   log "${ip}: running 'df -h' via root..."
   local df_output root_line
   df_output="$(root_cmd "${ip}" 'df -h' 2>/dev/null || true)"
@@ -227,6 +253,7 @@ collect_node_info(){
     log_warn "${ip}: root partition (mount '/') not found in df output."
   fi
 
+  # --- 5. Root: du /var/lib/docker/ ----------------------------------------
   log "${ip}: running 'du -xah --time --max-depth=3 /var/lib/docker/' via root..."
   local du_output docker_total_line overlay2_line
   du_output="$(root_cmd "${ip}" \
@@ -261,6 +288,7 @@ collect_node_info(){
     log_warn "${ip}: could not determine overlay2 size (no G-sized entries)."
   fi
 
+  # --- 6. Admin: disable root SSH -----------------------------------------
   disable_root_ssh "${ip}" || true
   log_ok "${ip}: data collection complete."
 }
@@ -368,7 +396,7 @@ print_report(){
 # MAIN
 # ---------------------------------------------------------------------------
 main(){
-  load_or_prompt_ips   # loads edge_nodes silently, or prompts+saves if missing
+  load_or_prompt_ips
   ask_admin_creds
   ask_root_creds
 
