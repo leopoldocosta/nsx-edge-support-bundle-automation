@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.1
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.2
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
 #   1. Admin login  → get uptime + version  (exact output line printed to log)
 #   2. Admin        → enable root SSH
-#   3. Root login   → df -h  (exact /dev/sda2 line printed to log)
+#   3. Root login   → df -h  (root partition identified by mount point '/', not device name)
 #   4. Root login   → du -xah --time --max-depth=3 /var/lib/docker/ (exact overlay2 line printed to log)
 #   5. Admin        → disable root SSH
 #   6. Final report with per-node summary
@@ -42,10 +42,9 @@ need_cmd grep
 # Associative arrays for per-node results
 # ---------------------------------------------------------------------------
 declare -A NODE_UPTIME
-declare -A NODE_UPTIME_RAW
 declare -A NODE_VERSION
-declare -A NODE_VERSION_RAW
-declare -A NODE_ROOT_PART_LINE       # exact df line for /dev/sda2
+declare -A NODE_ROOT_DEVICE          # actual device name found (e.g. /dev/sda2 or /dev/sda3)
+declare -A NODE_ROOT_PART_LINE       # exact df line for mount point /
 declare -A NODE_ROOT_PART_SIZE
 declare -A NODE_ROOT_PART_USED
 declare -A NODE_ROOT_PART_AVAIL
@@ -59,7 +58,7 @@ declare -A NODE_DOCKER_TOTAL
 declare -A NODE_ERROR
 
 # ---------------------------------------------------------------------------
-# Interactive IP collection (overrides collect_ips from common.sh)
+# Interactive IP collection
 # Reads IPs from stdin at startup; writes to EDGE_FILE so load_ips() works.
 # ---------------------------------------------------------------------------
 collect_ips_interactive(){
@@ -97,11 +96,8 @@ collect_node_info(){
   raw_uptime="$(admin_cmd "${ip}" 'get uptime'  2>/dev/null || true)"
   raw_version="$(admin_cmd "${ip}" 'get version' 2>/dev/null || true)"
 
-  # Store first meaningful line
-  NODE_UPTIME_RAW["${ip}"]="$(echo "${raw_uptime}"  | grep -v '^$' | head -1)"
-  NODE_VERSION_RAW["${ip}"]="$(echo "${raw_version}" | grep -v '^$' | head -1)"
-  NODE_UPTIME["${ip}"]="$(echo "${NODE_UPTIME_RAW[${ip}]}"  | xargs)"
-  NODE_VERSION["${ip}"]="$(echo "${NODE_VERSION_RAW[${ip}]}" | xargs)"
+  NODE_UPTIME["${ip}"]="$(echo "${raw_uptime}"  | grep -v '^$' | head -1 | xargs)"
+  NODE_VERSION["${ip}"]="$(echo "${raw_version}" | grep -v '^$' | head -1 | xargs)"
 
   if [[ -z "${NODE_UPTIME[${ip}]}" && -z "${NODE_VERSION[${ip}]}" ]]; then
     NODE_ERROR["${ip}"]="Admin SSH failed — node unreachable or bad credentials."
@@ -116,9 +112,9 @@ collect_node_info(){
   enable_root_ssh "${ip}"
   sleep 2
 
-  # --- 3. Root: df -h ------------------------------------------------------
+  # --- 3. Root: df -h (identify root partition by mount point '/') ----------
   log "${ip}: running 'df -h' via root..."
-  local df_output df_header sda2_line
+  local df_output df_header root_line
   df_output="$(root_cmd "${ip}" 'df -h' 2>/dev/null || true)"
 
   if [[ -z "${df_output}" ]]; then
@@ -129,25 +125,36 @@ collect_node_info(){
   fi
 
   df_header="$(echo "${df_output}" | head -1)"
-  sda2_line="$(echo "${df_output}" | awk '$1=="/dev/sda2"')"
-  NODE_ROOT_PART_LINE["${ip}"]="${sda2_line}"
-
   log "${ip}: [df header] >> ${df_header}"
 
-  if [[ -n "${sda2_line}" ]]; then
-    NODE_ROOT_PART_SIZE["${ip}"]="$(  echo "${sda2_line}" | awk '{print $2}')"
-    NODE_ROOT_PART_USED["${ip}"]="$(  echo "${sda2_line}" | awk '{print $3}')"
-    NODE_ROOT_PART_AVAIL["${ip}"]="$( echo "${sda2_line}" | awk '{print $4}')"
-    NODE_ROOT_PART_PCT["${ip}"]="$(   echo "${sda2_line}" | awk '{print $5}')"
+  # Match the line whose last field (Mounted on) is exactly '/'
+  # Handles both single-line and wrapped (long device name) df output.
+  root_line="$(echo "${df_output}" | awk '
+    # single-line entry: last field is exactly "/"
+    NF >= 6 && $NF == "/" { print; next }
+    # wrapped entry: line with only "/" (mount point on its own line)
+    # preceded by an incomplete line — join them
+    /^\/[^ ]/ && NF < 6 { prev=$0; next }
+    NF == 1 && $1 == "/" && prev != "" { print prev " " $1; prev=""; next }
+  ' | head -1)"
+
+  NODE_ROOT_PART_LINE["${ip}"]="${root_line}"
+  NODE_ROOT_DEVICE["${ip}"]="$(echo "${root_line}" | awk '{print $1}')"
+
+  if [[ -n "${root_line}" ]]; then
+    NODE_ROOT_PART_SIZE["${ip}"]="$(  echo "${root_line}" | awk '{print $2}')"
+    NODE_ROOT_PART_USED["${ip}"]="$(  echo "${root_line}" | awk '{print $3}')"
+    NODE_ROOT_PART_AVAIL["${ip}"]="$( echo "${root_line}" | awk '{print $4}')"
+    NODE_ROOT_PART_PCT["${ip}"]="$(   echo "${root_line}" | awk '{print $5}')"
     local pct_val
     pct_val="$(echo "${NODE_ROOT_PART_PCT[${ip}]}" | tr -d '%')"
 
     if [[ "${pct_val}" -ge 100 ]]; then
       NODE_ROOT_PART_STATUS["${ip}"]="FULL"
-      log_warn "${ip}: [df /dev/sda2] >> ${sda2_line}  <-- ROOT PARTITION FULL!"
+      log_warn "${ip}: [df /] >> ${root_line}  <-- ROOT PARTITION FULL!"
     else
       NODE_ROOT_PART_STATUS["${ip}"]="OK"
-      log_ok  "${ip}: [df /dev/sda2] >> ${sda2_line}"
+      log_ok  "${ip}: [df /] >> ${root_line}"
     fi
   else
     NODE_ROOT_PART_SIZE["${ip}"]="N/A"
@@ -156,7 +163,8 @@ collect_node_info(){
     NODE_ROOT_PART_PCT["${ip}"]="N/A"
     NODE_ROOT_PART_STATUS["${ip}"]="NOT_FOUND"
     NODE_ROOT_PART_LINE["${ip}"]="(not found)"
-    log_warn "${ip}: /dev/sda2 not found in df output."
+    NODE_ROOT_DEVICE["${ip}"]="unknown"
+    log_warn "${ip}: root partition (mount '/') not found in df output."
   fi
 
   # --- 4. Root: du /var/lib/docker/ ----------------------------------------
@@ -166,8 +174,8 @@ collect_node_info(){
     'du -xah --time --max-depth=3 /var/lib/docker/ 2>/dev/null | sort | grep G' \
     2>/dev/null || true)"
 
-  docker_total_line="$( echo "${du_output}" | awk '$NF=="/var/lib/docker"'       | tail -1)"
-  overlay2_line="$(     echo "${du_output}" | awk '$NF=="/var/lib/docker/overlay2"' | tail -1)"
+  docker_total_line="$( echo "${du_output}" | awk '$NF=="/var/lib/docker"'          | tail -1)"
+  overlay2_line="$(     echo "${du_output}" | awk '$NF=="/var/lib/docker/overlay2"'  | tail -1)"
 
   NODE_DOCKER_TOTAL_LINE["${ip}"]="${docker_total_line:-(not found)}"
   NODE_OVERLAY2_LINE["${ip}"]="${overlay2_line:-(not found)}"
@@ -178,17 +186,17 @@ collect_node_info(){
   overlay2_size="$(echo "${overlay2_line}" | awk '{print $1}')"
   NODE_OVERLAY2_SIZE["${ip}"]="${overlay2_size:-N/A}"
 
-  log_ok "${ip}: [du /var/lib/docker]         >> ${NODE_DOCKER_TOTAL_LINE[${ip}]}"
+  log_ok "${ip}: [du /var/lib/docker]  >> ${NODE_DOCKER_TOTAL_LINE[${ip}]}"
 
   if [[ -n "${overlay2_size}" ]]; then
     local overlay_num
     overlay_num="$(echo "${overlay2_size}" | tr -d 'G')"
     if awk "BEGIN{exit !(${overlay_num}+0 >= 10)}"; then
       NODE_OVERLAY2_STATUS["${ip}"]="HIGH"
-      log_warn "${ip}: [du overlay2]  >> ${overlay2_line}  <-- overlay2 CAUSING ROOT FULL!"
+      log_warn "${ip}: [du overlay2]        >> ${overlay2_line}  <-- overlay2 CAUSING ROOT FULL!"
     else
       NODE_OVERLAY2_STATUS["${ip}"]="OK"
-      log_ok  "${ip}: [du overlay2]  >> ${overlay2_line}"
+      log_ok  "${ip}: [du overlay2]        >> ${overlay2_line}"
     fi
   else
     NODE_OVERLAY2_STATUS["${ip}"]="N/A"
@@ -235,11 +243,12 @@ print_report(){
       local root_status="${NODE_ROOT_PART_STATUS[${ip}]:-N/A}"
       local root_flag=""
       [[ "${root_status}" == "FULL"      ]] && root_flag="  <-- *** ROOT PARTITION FULL ***"
-      [[ "${root_status}" == "NOT_FOUND" ]] && root_flag="  <-- /dev/sda2 not found"
+      [[ "${root_status}" == "NOT_FOUND" ]] && root_flag="  <-- root partition not found"
 
-      printf '  %-22s %s\n'   "df -h output:"     ""
+      printf '  %-22s %s\n' "Root device:" "${NODE_ROOT_DEVICE[${ip}]:-unknown}"
+      printf '  %-22s\n'    "df -h output:"
       printf '    Filesystem  Size  Used  Avail  Use%%  Mounted on\n'
-      printf '    %s%s\n'     "${NODE_ROOT_PART_LINE[${ip}]:-N/A}" "${root_flag}"
+      printf '    %s%s\n'   "${NODE_ROOT_PART_LINE[${ip}]:-N/A}" "${root_flag}"
       echo ""
 
       # Docker overlay2
@@ -247,9 +256,9 @@ print_report(){
       local ov_flag=""
       [[ "${ov_status}" == "HIGH" ]] && ov_flag="  <-- *** overlay2 CAUSING ROOT FULL ***"
 
-      printf '  %-22s %s\n' "du /var/lib/docker/:" ""
-      printf '    %s\n'     "${NODE_DOCKER_TOTAL_LINE[${ip}]:-N/A}"
-      printf '    %s%s\n'  "${NODE_OVERLAY2_LINE[${ip}]:-N/A}" "${ov_flag}"
+      printf '  %-22s\n'  "du /var/lib/docker/:"
+      printf '    %s\n'   "${NODE_DOCKER_TOTAL_LINE[${ip}]:-N/A}"
+      printf '    %s%s\n' "${NODE_OVERLAY2_LINE[${ip}]:-N/A}" "${ov_flag}"
       echo ""
 
       # Verdict
