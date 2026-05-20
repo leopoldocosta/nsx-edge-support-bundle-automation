@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.3
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.4
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
 #   1. Admin login  → get uptime + version  (exact output line printed to log)
 #   2. Admin        → enable root SSH
 #   3. Root login   → df -h  (root partition identified by mount point '/', not device name)
-#   4. Root login   → du -xah --time --max-depth=3 /var/lib/docker/ (exact overlay2 line printed to log)
+#   4. Root login   → du -xah --time --max-depth=3 /var/lib/docker/ (exact overlay2 line)
 #   5. Admin        → disable root SSH
 #   6. Final report with per-node detail + ACTION REQUIRED summary list
+#
+# FIX v1.4: exec > >(tee) is started AFTER all interactive prompts so that
+# read -rp and password prompts always bind to /dev/tty (the real terminal)
+# and are never swallowed by the tee redirect.
+# All read calls use </dev/tty explicitly as an extra safety net.
 #
 # Usage:
 #   bash kb404700_disk_validation.sh
@@ -21,16 +26,7 @@ export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 
 # ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-REPORT_FILE="${LOG_DIR}/kb404700_report_$(date '+%Y%m%d_%H%M%S').txt"
-LOG_FILE="${LOG_DIR}/kb404700_run_$(date '+%Y%m%d_%H%M%S').log"
-
-# Tee stdout+stderr to log file
-exec > >(tee -a "${LOG_FILE}") 2>&1
-
-# ---------------------------------------------------------------------------
-# Dependency check
+# Dependency check (before tee redirect)
 # ---------------------------------------------------------------------------
 need_cmd ssh
 need_cmd sshpass
@@ -43,33 +39,33 @@ need_cmd grep
 # ---------------------------------------------------------------------------
 declare -A NODE_UPTIME
 declare -A NODE_VERSION
-declare -A NODE_ROOT_DEVICE          # actual device name found (e.g. /dev/sda2 or /dev/sda3)
-declare -A NODE_ROOT_PART_LINE       # exact df line for mount point /
+declare -A NODE_ROOT_DEVICE
+declare -A NODE_ROOT_PART_LINE
 declare -A NODE_ROOT_PART_SIZE
 declare -A NODE_ROOT_PART_USED
 declare -A NODE_ROOT_PART_AVAIL
 declare -A NODE_ROOT_PART_PCT
 declare -A NODE_ROOT_PART_STATUS     # OK | FULL | NOT_FOUND
-declare -A NODE_OVERLAY2_LINE        # exact du line for /var/lib/docker/overlay2
+declare -A NODE_OVERLAY2_LINE
 declare -A NODE_OVERLAY2_SIZE
 declare -A NODE_OVERLAY2_STATUS      # OK | HIGH | N/A
-declare -A NODE_DOCKER_TOTAL_LINE    # exact du line for /var/lib/docker
+declare -A NODE_DOCKER_TOTAL_LINE
 declare -A NODE_DOCKER_TOTAL
 declare -A NODE_ERROR
-declare -A NODE_HOSTNAME             # hostname collected via root
+declare -A NODE_HOSTNAME
 
 # ---------------------------------------------------------------------------
 # Interactive IP collection
-# Reads IPs from stdin at startup; writes to EDGE_FILE so load_ips() works.
+# All reads explicitly use </dev/tty so they are never affected by any
+# stdout/stdin redirection that may be active in the calling shell.
 # ---------------------------------------------------------------------------
 collect_ips_interactive(){
-  echo ""
-  echo "Enter Edge Node IPs, one per line. Empty line to finish:"
+  printf '\nEnter Edge Node IPs, one per line. Empty line to finish:\n' >/dev/tty
   : > "${EDGE_FILE}"
-  while IFS= read -rp "  IP: " line; do
-    [[ -z "$line" ]] && break
-    if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$line" >> "${EDGE_FILE}"
+  while IFS= read -rp '  IP: ' line </dev/tty; do
+    [[ -z "${line}" ]] && break
+    if [[ "${line}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s\n' "${line}" >> "${EDGE_FILE}"
       log "Added: ${line}"
     else
       log_warn "Skipping invalid entry: ${line}"
@@ -82,6 +78,33 @@ collect_ips_interactive(){
     log_err "No valid IPs provided. Aborting."
     exit 1
   fi
+}
+
+# ---------------------------------------------------------------------------
+# ask_admin_creds / ask_root_creds overrides bound to /dev/tty
+# These replace the common.sh versions for this script so that prompts
+# always appear on the terminal regardless of stdout redirection.
+# ---------------------------------------------------------------------------
+ask_admin_creds(){
+  if [[ -n "${NSX_PASS:-}" ]]; then
+    log "Admin credentials already in environment (user: '${NSX_USER:-admin}')."
+    return 0
+  fi
+  IFS= read -rp 'Admin username [admin]: ' NSX_USER </dev/tty
+  NSX_USER="${NSX_USER:-admin}"
+  IFS= read -rsp 'Admin password: ' NSX_PASS </dev/tty; printf '\n' >/dev/tty
+  export NSX_USER NSX_PASS
+  log "Admin credentials collected for user '${NSX_USER}'."
+}
+
+ask_root_creds(){
+  if [[ -n "${ROOT_PASS:-}" ]]; then
+    log "Root credentials already in environment."
+    return 0
+  fi
+  IFS= read -rsp 'Root password: ' ROOT_PASS </dev/tty; printf '\n' >/dev/tty
+  export ROOT_PASS
+  log "Root credentials collected."
 }
 
 # ---------------------------------------------------------------------------
@@ -113,7 +136,7 @@ collect_node_info(){
   enable_root_ssh "${ip}"
   sleep 2
 
-  # --- 3a. Root: collect hostname ------------------------------------------
+  # --- 3a. Root: hostname --------------------------------------------------
   local raw_hostname
   raw_hostname="$(root_cmd "${ip}" 'hostname' 2>/dev/null || true)"
   NODE_HOSTNAME["${ip}"]="$(echo "${raw_hostname}" | grep -v '^$' | head -1 | xargs)"
@@ -134,8 +157,6 @@ collect_node_info(){
   df_header="$(echo "${df_output}" | head -1)"
   log "${ip}: [df header] >> ${df_header}"
 
-  # Match the line whose last field (Mounted on) is exactly '/'
-  # Handles both single-line and wrapped (long device name) df output.
   root_line="$(echo "${df_output}" | awk '
     NF >= 6 && $NF == "/" { print; next }
     /^\/[^ ]/ && NF < 6   { prev=$0; next }
@@ -152,7 +173,6 @@ collect_node_info(){
     NODE_ROOT_PART_PCT["${ip}"]="$(   echo "${root_line}" | awk '{print $5}')"
     local pct_val
     pct_val="$(echo "${NODE_ROOT_PART_PCT[${ip}]}" | tr -d '%')"
-
     if [[ "${pct_val}" -ge 100 ]]; then
       NODE_ROOT_PART_STATUS["${ip}"]="FULL"
       log_warn "${ip}: [df /] >> ${root_line}  <-- ROOT PARTITION FULL!"
@@ -220,7 +240,6 @@ print_report(){
   sep="$(printf '=%.0s' {1..80})"
   thin_sep="$(printf -- '-%.0s' {1..80})"
 
-  # Build ACTION REQUIRED list while iterating
   local action_nodes=()
 
   {
@@ -247,7 +266,6 @@ print_report(){
       printf '  %-22s %s\n' "Version:"  "${NODE_VERSION[${ip}]:-N/A}"
       echo ""
 
-      # Root partition
       local root_status="${NODE_ROOT_PART_STATUS[${ip}]:-N/A}"
       local root_flag=""
       [[ "${root_status}" == "FULL"      ]] && root_flag="  <-- *** ROOT PARTITION FULL ***"
@@ -259,7 +277,6 @@ print_report(){
       printf '    %s%s\n'   "${NODE_ROOT_PART_LINE[${ip}]:-N/A}" "${root_flag}"
       echo ""
 
-      # Docker overlay2
       local ov_status="${NODE_OVERLAY2_STATUS[${ip}]:-N/A}"
       local ov_flag=""
       [[ "${ov_status}" == "HIGH" ]] && ov_flag="  <-- *** overlay2 CAUSING ROOT FULL ***"
@@ -269,7 +286,6 @@ print_report(){
       printf '    %s%s\n' "${NODE_OVERLAY2_LINE[${ip}]:-N/A}" "${ov_flag}"
       echo ""
 
-      # Verdict
       local verdict="OK"
       if [[ "${root_status}" == "FULL" || "${ov_status}" == "HIGH" ]]; then
         verdict="ACTION REQUIRED"
@@ -281,9 +297,6 @@ print_report(){
       echo ""
     done
 
-    # -----------------------------------------------------------------
-    # ACTION REQUIRED summary list
-    # -----------------------------------------------------------------
     echo "${sep}"
     printf '  NODES REQUIRING ACTION\n'
     echo "${sep}"
@@ -311,14 +324,24 @@ print_report(){
 
 # ---------------------------------------------------------------------------
 # MAIN
+# collect_ips_interactive and ask_*_creds run BEFORE exec > >(tee) so that
+# all interactive prompts go directly to /dev/tty without interference.
+# The tee redirect is started only after credentials are in memory.
 # ---------------------------------------------------------------------------
 main(){
-  log "=== KB404700 Disk Validation — START ==="
-
+  # --- Interactive prompts (no tee active yet) ----------------------------
   collect_ips_interactive
   load_ips
   ask_admin_creds
   ask_root_creds
+
+  # --- Start tee logging AFTER all prompts --------------------------------
+  REPORT_FILE="${LOG_DIR}/kb404700_report_$(date '+%Y%m%d_%H%M%S').txt"
+  LOG_FILE="${LOG_DIR}/kb404700_run_$(date '+%Y%m%d_%H%M%S').log"
+  exec > >(tee -a "${LOG_FILE}") 2>&1
+
+  log "=== KB404700 Disk Validation — START ==="
+  log "Loaded ${#EDGE_IPS[@]} Edge Node(s): ${EDGE_IPS[*]}"
 
   local failed_nodes=()
   for ip in "${EDGE_IPS[@]}"; do
