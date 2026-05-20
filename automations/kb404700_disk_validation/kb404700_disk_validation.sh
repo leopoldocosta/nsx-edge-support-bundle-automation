@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.6
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.7
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
-#   1. Admin login  → get uptime + version  (exact output line printed to log)
+#   1. Admin login  → get uptime + version
 #   2. Admin        → enable root SSH
 #   3. Root login   → hostname
-#   4. Root login   → df -h  (root partition identified by mount point '/')
+#   4. Root login   → df -h  (root partition by mount point '/')
 #   5. Root login   → du -xah --time --max-depth=3 /var/lib/docker/
 #   6. Admin        → disable root SSH
 #   7. Final report: per-node detail + ACTION REQUIRED summary table
-#      (columns: #, Hostname, IP, Uptime(d), Version, Root%, overlay2)
 #
-# FIX v1.4: exec > >(tee) is started AFTER all interactive prompts.
-# All read calls use </dev/tty explicitly as an extra safety net.
+# IP LIST PERSISTENCE (v1.7):
+#   - If edge_nodes exists alongside the script → loaded automatically, no prompt.
+#   - If edge_nodes does NOT exist → interactive prompt runs and the result
+#     is saved to edge_nodes for all future runs.
+#   - To change the list: edit edge_nodes directly, or delete it to re-prompt.
 #
-# Usage:
-#   bash kb404700_disk_validation.sh
+# FIX v1.4: exec > >(tee) started AFTER all interactive prompts.
+# All read calls use </dev/tty explicitly.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -24,8 +26,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 
+# EDGE_FILE is already defined by common.sh as ${AUTO_DIR}/edge_nodes
+# (same directory as this script, so it resolves correctly)
+
 # ---------------------------------------------------------------------------
-# Dependency check (before tee redirect)
+# Dependency check
 # ---------------------------------------------------------------------------
 need_cmd ssh
 need_cmd sshpass
@@ -37,9 +42,9 @@ need_cmd grep
 # Associative arrays
 # ---------------------------------------------------------------------------
 declare -A NODE_UPTIME
-declare -A NODE_UPTIME_DAYS          # numeric days extracted from uptime string
+declare -A NODE_UPTIME_DAYS
 declare -A NODE_VERSION
-declare -A NODE_VERSION_SHORT        # x.y.z.w extracted from version string
+declare -A NODE_VERSION_SHORT
 declare -A NODE_ROOT_DEVICE
 declare -A NODE_ROOT_PART_LINE
 declare -A NODE_ROOT_PART_SIZE
@@ -56,10 +61,13 @@ declare -A NODE_ERROR
 declare -A NODE_HOSTNAME
 
 # ---------------------------------------------------------------------------
-# Interactive IP collection
+# collect_ips_interactive
+# Called only when edge_nodes does not exist.
+# Saves the result to edge_nodes so the next run skips the prompt entirely.
 # ---------------------------------------------------------------------------
 collect_ips_interactive(){
-  printf '\nEnter Edge Node IPs, one per line. Empty line to finish:\n' >/dev/tty
+  printf '\nNo edge_nodes file found.\n' >/dev/tty
+  printf 'Enter Edge Node IPs, one per line. Empty line to finish:\n' >/dev/tty
   : > "${EDGE_FILE}"
   while IFS= read -rp '  IP: ' line </dev/tty; do
     [[ -z "${line}" ]] && break
@@ -72,11 +80,27 @@ collect_ips_interactive(){
   done
   local count
   count=$(wc -l < "${EDGE_FILE}" | tr -d ' ')
-  log "${count} IP(s) registered."
   if [[ "${count}" -eq 0 ]]; then
     log_err "No valid IPs provided. Aborting."
     exit 1
   fi
+  log "${count} IP(s) saved to: ${EDGE_FILE}"
+  printf '  (IPs saved — next run will load this file automatically)\n' >/dev/tty
+}
+
+# ---------------------------------------------------------------------------
+# load_or_prompt_ips
+# If edge_nodes exists: load it silently.
+# If not: run interactive collection and save.
+# ---------------------------------------------------------------------------
+load_or_prompt_ips(){
+  if [[ -f "${EDGE_FILE}" && -s "${EDGE_FILE}" ]]; then
+    log "IP list loaded from: ${EDGE_FILE}"
+    log "  (delete or edit the file to change the list)"
+  else
+    collect_ips_interactive
+  fi
+  load_ips
 }
 
 # ---------------------------------------------------------------------------
@@ -105,9 +129,7 @@ ask_root_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# parse_uptime_days  "19:49:19 up 78 days, 17:32, ..."
-# Extracts the numeric day count. Returns "N/A" if not found.
-# Handles both "X day," and "X days," (singular/plural).
+# Parsers
 # ---------------------------------------------------------------------------
 parse_uptime_days(){
   local raw="$1"
@@ -116,11 +138,6 @@ parse_uptime_days(){
   echo "${days:-N/A}"
 }
 
-# ---------------------------------------------------------------------------
-# parse_version_short  "VMware NSX Software, Version 4.2.1.3.0.24533894"
-# Extracts the first x.y.z.w quad (4 numeric groups) from the string.
-# Returns "N/A" if not found.
-# ---------------------------------------------------------------------------
 parse_version_short(){
   local raw="$1"
   local ver
@@ -135,7 +152,6 @@ collect_node_info(){
   local ip="$1"
   NODE_ERROR["${ip}"]=""
 
-  # --- 1. Admin: uptime + version ----------------------------------------
   log "${ip}: collecting uptime and version via admin..."
   local raw_uptime raw_version
   raw_uptime="$(admin_cmd "${ip}" 'get uptime'  2>/dev/null || true)"
@@ -156,19 +172,16 @@ collect_node_info(){
   log_ok "${ip}: [uptime]   >> ${NODE_UPTIME[${ip}]}"
   log_ok "${ip}: [version]  >> ${NODE_VERSION[${ip}]}"
 
-  # --- 2. Admin: enable root SSH ------------------------------------------
   enable_root_ssh "${ip}"
   sleep 2
 
-  # --- 3. Root: hostname ---------------------------------------------------
   local raw_hostname
   raw_hostname="$(root_cmd "${ip}" 'hostname' 2>/dev/null || true)"
   NODE_HOSTNAME["${ip}"]="$(echo "${raw_hostname}" | grep -v '^$' | head -1 | xargs)"
   NODE_HOSTNAME["${ip}"]="${NODE_HOSTNAME[${ip}]:-${ip}}"
 
-  # --- 4. Root: df -h ------------------------------------------------------
   log "${ip}: running 'df -h' via root..."
-  local df_output df_header root_line
+  local df_output root_line
   df_output="$(root_cmd "${ip}" 'df -h' 2>/dev/null || true)"
 
   if [[ -z "${df_output}" ]]; then
@@ -178,8 +191,7 @@ collect_node_info(){
     return 1
   fi
 
-  df_header="$(echo "${df_output}" | head -1)"
-  log "${ip}: [df header] >> ${df_header}"
+  log "${ip}: [df header] >> $(echo "${df_output}" | head -1)"
 
   root_line="$(echo "${df_output}" | awk '
     NF >= 6 && $NF == "/" { print; next }
@@ -215,19 +227,17 @@ collect_node_info(){
     log_warn "${ip}: root partition (mount '/') not found in df output."
   fi
 
-  # --- 5. Root: du /var/lib/docker/ ----------------------------------------
-  log "${ip}: running 'du -xah --time --max-depth=3 /var/lib/docker/' via root (may take a while)..."
+  log "${ip}: running 'du -xah --time --max-depth=3 /var/lib/docker/' via root..."
   local du_output docker_total_line overlay2_line
   du_output="$(root_cmd "${ip}" \
     'du -xah --time --max-depth=3 /var/lib/docker/ 2>/dev/null | sort | grep G' \
     2>/dev/null || true)"
 
-  docker_total_line="$( echo "${du_output}" | awk '$NF=="/var/lib/docker"'          | tail -1)"
-  overlay2_line="$(     echo "${du_output}" | awk '$NF=="/var/lib/docker/overlay2"'  | tail -1)"
+  docker_total_line="$( echo "${du_output}" | awk '$NF=="/var/lib/docker"'         | tail -1)"
+  overlay2_line="$(     echo "${du_output}" | awk '$NF=="/var/lib/docker/overlay2"' | tail -1)"
 
   NODE_DOCKER_TOTAL_LINE["${ip}"]="${docker_total_line:-(not found)}"
   NODE_OVERLAY2_LINE["${ip}"]="${overlay2_line:-(not found)}"
-  NODE_DOCKER_TOTAL["${ip}"]="$(echo "${docker_total_line}" | awk '{print $1}')"
   NODE_DOCKER_TOTAL["${ip}"]="${NODE_DOCKER_TOTAL[${ip}]:-N/A}"
 
   local overlay2_size
@@ -241,17 +251,16 @@ collect_node_info(){
     overlay_num="$(echo "${overlay2_size}" | tr -d 'G')"
     if awk "BEGIN{exit !(${overlay_num}+0 >= 10)}"; then
       NODE_OVERLAY2_STATUS["${ip}"]="HIGH"
-      log_warn "${ip}: [du overlay2]        >> ${overlay2_line}  <-- overlay2 CAUSING ROOT FULL!"
+      log_warn "${ip}: [du overlay2] >> ${overlay2_line}  <-- overlay2 CAUSING ROOT FULL!"
     else
       NODE_OVERLAY2_STATUS["${ip}"]="OK"
-      log_ok  "${ip}: [du overlay2]        >> ${overlay2_line}"
+      log_ok  "${ip}: [du overlay2] >> ${overlay2_line}"
     fi
   else
     NODE_OVERLAY2_STATUS["${ip}"]="N/A"
-    log_warn "${ip}: could not determine /var/lib/docker/overlay2 size (no G-sized entries)."
+    log_warn "${ip}: could not determine overlay2 size (no G-sized entries)."
   fi
 
-  # --- 6. Admin: disable root SSH -----------------------------------------
   disable_root_ssh "${ip}" || true
   log_ok "${ip}: data collection complete."
 }
@@ -321,10 +330,6 @@ print_report(){
       echo ""
     done
 
-    # -----------------------------------------------------------------
-    # ACTION REQUIRED summary table
-    # Columns: #  Hostname  IP  Uptime(d)  Version  Root%  overlay2
-    # -----------------------------------------------------------------
     echo "${sep}"
     printf '  NODES REQUIRING ACTION\n'
     echo "${sep}"
@@ -363,8 +368,7 @@ print_report(){
 # MAIN
 # ---------------------------------------------------------------------------
 main(){
-  collect_ips_interactive
-  load_ips
+  load_or_prompt_ips   # loads edge_nodes silently, or prompts+saves if missing
   ask_admin_creds
   ask_root_creds
 
@@ -383,12 +387,9 @@ main(){
     fi
   done
 
-  if [[ ${#failed_nodes[@]} -gt 0 ]]; then
-    log_warn "The following nodes had errors: ${failed_nodes[*]}"
-  fi
+  [[ ${#failed_nodes[@]} -gt 0 ]] && log_warn "Nodes with errors: ${failed_nodes[*]}"
 
   print_report
-
   clear_creds
   log "=== KB404700 Disk Validation — DONE ==="
 }
