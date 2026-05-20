@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.4
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.5
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
@@ -9,10 +9,9 @@
 #   4. Root login   → du -xah --time --max-depth=3 /var/lib/docker/ (exact overlay2 line)
 #   5. Admin        → disable root SSH
 #   6. Final report with per-node detail + ACTION REQUIRED summary list
+#      (summary includes root%, overlay2 size columns)
 #
-# FIX v1.4: exec > >(tee) is started AFTER all interactive prompts so that
-# read -rp and password prompts always bind to /dev/tty (the real terminal)
-# and are never swallowed by the tee redirect.
+# FIX v1.4: exec > >(tee) is started AFTER all interactive prompts.
 # All read calls use </dev/tty explicitly as an extra safety net.
 #
 # Usage:
@@ -56,8 +55,6 @@ declare -A NODE_HOSTNAME
 
 # ---------------------------------------------------------------------------
 # Interactive IP collection
-# All reads explicitly use </dev/tty so they are never affected by any
-# stdout/stdin redirection that may be active in the calling shell.
 # ---------------------------------------------------------------------------
 collect_ips_interactive(){
   printf '\nEnter Edge Node IPs, one per line. Empty line to finish:\n' >/dev/tty
@@ -81,9 +78,7 @@ collect_ips_interactive(){
 }
 
 # ---------------------------------------------------------------------------
-# ask_admin_creds / ask_root_creds overrides bound to /dev/tty
-# These replace the common.sh versions for this script so that prompts
-# always appear on the terminal regardless of stdout redirection.
+# Credential overrides bound to /dev/tty
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
@@ -297,6 +292,10 @@ print_report(){
       echo ""
     done
 
+    # -----------------------------------------------------------------
+    # ACTION REQUIRED summary table
+    # Columns: #  Hostname  IP  Root%  overlay2
+    # -----------------------------------------------------------------
     echo "${sep}"
     printf '  NODES REQUIRING ACTION\n'
     echo "${sep}"
@@ -304,11 +303,18 @@ print_report(){
     if [[ ${#action_nodes[@]} -eq 0 ]]; then
       printf '  All nodes are OK. No action required.\n'
     else
-      printf '  %-4s  %-30s  %s\n' "#" "Hostname" "IP"
-      printf '  %-4s  %-30s  %s\n' "----" "------------------------------" "---------------"
+      printf '  %-4s  %-28s  %-17s  %-7s  %s\n' \
+        "#" "Hostname" "IP" "Root%" "overlay2"
+      printf '  %-4s  %-28s  %-17s  %-7s  %s\n' \
+        "----" "----------------------------" "-----------------" "-------" "--------"
       local idx=1
       for aip in "${action_nodes[@]}"; do
-        printf '  %-4s  %-30s  %s\n' "${idx}." "${NODE_HOSTNAME[${aip}]:-N/A}" "${aip}"
+        printf '  %-4s  %-28s  %-17s  %-7s  %s\n' \
+          "${idx}." \
+          "${NODE_HOSTNAME[${aip}]:-N/A}" \
+          "${aip}" \
+          "${NODE_ROOT_PART_PCT[${aip}]:-N/A}" \
+          "${NODE_OVERLAY2_SIZE[${aip}]:-N/A}"
         (( idx++ ))
       done
     fi
@@ -329,13 +335,11 @@ print_report(){
 # The tee redirect is started only after credentials are in memory.
 # ---------------------------------------------------------------------------
 main(){
-  # --- Interactive prompts (no tee active yet) ----------------------------
   collect_ips_interactive
   load_ips
   ask_admin_creds
   ask_root_creds
 
-  # --- Start tee logging AFTER all prompts --------------------------------
   REPORT_FILE="${LOG_DIR}/kb404700_report_$(date '+%Y%m%d_%H%M%S').txt"
   LOG_FILE="${LOG_DIR}/kb404700_run_$(date '+%Y%m%d_%H%M%S').log"
   exec > >(tee -a "${LOG_FILE}") 2>&1
