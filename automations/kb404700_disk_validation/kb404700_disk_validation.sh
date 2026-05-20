@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.2
+# automations/kb404700_disk_validation/kb404700_disk_validation.sh — v1.3
 # KB404700 — NSX Edge Node: Root Partition & Docker overlay2 Disk Validation
 #
 # Flow per node:
@@ -8,7 +8,7 @@
 #   3. Root login   → df -h  (root partition identified by mount point '/', not device name)
 #   4. Root login   → du -xah --time --max-depth=3 /var/lib/docker/ (exact overlay2 line printed to log)
 #   5. Admin        → disable root SSH
-#   6. Final report with per-node summary
+#   6. Final report with per-node detail + ACTION REQUIRED summary list
 #
 # Usage:
 #   bash kb404700_disk_validation.sh
@@ -56,6 +56,7 @@ declare -A NODE_OVERLAY2_STATUS      # OK | HIGH | N/A
 declare -A NODE_DOCKER_TOTAL_LINE    # exact du line for /var/lib/docker
 declare -A NODE_DOCKER_TOTAL
 declare -A NODE_ERROR
+declare -A NODE_HOSTNAME             # hostname collected via root
 
 # ---------------------------------------------------------------------------
 # Interactive IP collection
@@ -112,7 +113,13 @@ collect_node_info(){
   enable_root_ssh "${ip}"
   sleep 2
 
-  # --- 3. Root: df -h (identify root partition by mount point '/') ----------
+  # --- 3a. Root: collect hostname ------------------------------------------
+  local raw_hostname
+  raw_hostname="$(root_cmd "${ip}" 'hostname' 2>/dev/null || true)"
+  NODE_HOSTNAME["${ip}"]="$(echo "${raw_hostname}" | grep -v '^$' | head -1 | xargs)"
+  NODE_HOSTNAME["${ip}"]="${NODE_HOSTNAME[${ip}]:-${ip}}"
+
+  # --- 3b. Root: df -h (identify root partition by mount point '/') --------
   log "${ip}: running 'df -h' via root..."
   local df_output df_header root_line
   df_output="$(root_cmd "${ip}" 'df -h' 2>/dev/null || true)"
@@ -130,11 +137,8 @@ collect_node_info(){
   # Match the line whose last field (Mounted on) is exactly '/'
   # Handles both single-line and wrapped (long device name) df output.
   root_line="$(echo "${df_output}" | awk '
-    # single-line entry: last field is exactly "/"
     NF >= 6 && $NF == "/" { print; next }
-    # wrapped entry: line with only "/" (mount point on its own line)
-    # preceded by an incomplete line — join them
-    /^\/[^ ]/ && NF < 6 { prev=$0; next }
+    /^\/[^ ]/ && NF < 6   { prev=$0; next }
     NF == 1 && $1 == "/" && prev != "" { print prev " " $1; prev=""; next }
   ' | head -1)"
 
@@ -216,6 +220,9 @@ print_report(){
   sep="$(printf '=%.0s' {1..80})"
   thin_sep="$(printf -- '-%.0s' {1..80})"
 
+  # Build ACTION REQUIRED list while iterating
+  local action_nodes=()
+
   {
     echo ""
     echo "${sep}"
@@ -235,8 +242,9 @@ print_report(){
         continue
       fi
 
-      printf '  %-22s %s\n' "Uptime:"  "${NODE_UPTIME[${ip}]:-N/A}"
-      printf '  %-22s %s\n' "Version:" "${NODE_VERSION[${ip}]:-N/A}"
+      printf '  %-22s %s\n' "Hostname:" "${NODE_HOSTNAME[${ip}]:-N/A}"
+      printf '  %-22s %s\n' "Uptime:"   "${NODE_UPTIME[${ip}]:-N/A}"
+      printf '  %-22s %s\n' "Version:"  "${NODE_VERSION[${ip}]:-N/A}"
       echo ""
 
       # Root partition
@@ -265,6 +273,7 @@ print_report(){
       local verdict="OK"
       if [[ "${root_status}" == "FULL" || "${ov_status}" == "HIGH" ]]; then
         verdict="ACTION REQUIRED"
+        action_nodes+=("${ip}")
       fi
       printf '  %-22s %s\n' "VERDICT:" "${verdict}"
       echo ""
@@ -272,6 +281,25 @@ print_report(){
       echo ""
     done
 
+    # -----------------------------------------------------------------
+    # ACTION REQUIRED summary list
+    # -----------------------------------------------------------------
+    echo "${sep}"
+    printf '  NODES REQUIRING ACTION\n'
+    echo "${sep}"
+    echo ""
+    if [[ ${#action_nodes[@]} -eq 0 ]]; then
+      printf '  All nodes are OK. No action required.\n'
+    else
+      printf '  %-4s  %-30s  %s\n' "#" "Hostname" "IP"
+      printf '  %-4s  %-30s  %s\n' "----" "------------------------------" "---------------"
+      local idx=1
+      for aip in "${action_nodes[@]}"; do
+        printf '  %-4s  %-30s  %s\n' "${idx}." "${NODE_HOSTNAME[${aip}]:-N/A}" "${aip}"
+        (( idx++ ))
+      done
+    fi
+    echo ""
     echo "${sep}"
     echo "  END OF REPORT"
     echo "${sep}"
