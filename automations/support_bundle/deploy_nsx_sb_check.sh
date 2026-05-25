@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.16.3
+# deploy_nsx_sb_check.sh  v3.16.4
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
+# CHANGELOG v3.16.4:
+#   - FIX: nsx_sb_precheck.sh usava regex no nome do arquivo para calcular
+#     idade do bundle. Qualquer nome fora do padrao sb_IP_YYYYMMDD_HHMMSS.tgz
+#     recebia pc_age_days=999 ("antigo"). Corrigido para usar stat -c '%Y'
+#     diretamente no node remoto — funciona com qualquer nome de arquivo.
+#
 # CHANGELOG v3.16.3:
-#   - FIX: _save_creds usava printf com formato unico para os 3 campos.
-#     Senhas com caracteres especiais (%, !, $, \) eram corrompidas no
-#     arquivo de sessao. Corrigido para gravar cada campo individualmente
-#     com { printf '%s' "$val"; echo; } evitando qualquer interpretacao.
+#   - FIX: _save_creds — senha com caracteres especiais (%, !, $, \) nao
+#     corrompe mais o arquivo de sessao.
 #
 # CHANGELOG v3.16.2:
 #   - FIX: (( pc_total++ )) -> pc_total=$(( pc_total + 1 ))
@@ -35,7 +39,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${AUTO_DIR}/.ssh_keys" "${LIB_DIR
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.16.3"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.16.4"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -72,11 +76,11 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.16.3
+# lib/common.sh  — v3.16.4
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.16.3
+# lib/common.sh  — v3.16.4
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -203,12 +207,6 @@ load_ips(){
   log "Loaded ${#EDGE_IPS[@]} Edge Node(s): ${EDGE_IPS[*]}"
 }
 
-# ---------------------------------------------------------------------------
-# _save_creds — FIX v3.16.3
-# Cada campo e gravado individualmente com printf '%s' para evitar que
-# caracteres especiais na senha (%, !, $, \) sejam interpretados pelo
-# formato do printf e corrompam o arquivo de sessao.
-# ---------------------------------------------------------------------------
 _save_creds(){
   ( umask 177
     { printf 'NSX_USER='; printf '%s' "${NSX_USER:-}"; printf '\n'
@@ -633,9 +631,20 @@ prompt_clear_creds
 TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
+# ---------------------------------------------------------------------------
+# nsx_sb_precheck.sh  — v3.16.4
+# FIX: idade do bundle calculada via stat mtime no node remoto.
+#      Qualquer nome de arquivo funciona, nao apenas sb_IP_YYYYMMDD_HHMMSS.tgz
+# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
 #!/usr/bin/env bash
-# nsx_sb_precheck.sh  — v3.16.3
+# nsx_sb_precheck.sh  — v3.16.4
+#
+# FIX v3.16.4:
+#   Idade do bundle era calculada por regex no nome do arquivo.
+#   Nomes fora do padrao sb_IP_YYYYMMDD_HHMMSS.tgz recebiam 999 dias.
+#   Corrigido para usar stat -c '%Y' no node remoto — funciona com
+#   qualquer convencao de nome (sb-YYYYMMDD-HHhMM.tgz, sbYYMMDD-node.tgz, etc).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -714,13 +723,17 @@ for ip in "${EDGE_IPS[@]}"; do
   while IFS= read -r fname; do
     [[ -z "$fname" ]] && continue
     pc_total=$(( pc_total + 1 ))
-    pc_age_days=0
-    if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_[0-9]{6}\.tgz$ ]]; then
-      pc_file_epoch=$(date -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}" +%s 2>/dev/null || echo "$now_epoch")
+
+    # FIX v3.16.4: usar mtime real via stat no node — independente do nome do arquivo
+    pc_file_epoch="$(root_cmd "$ip" \
+      "stat -c '%Y' /var/vmware/nsx/file-store/${fname} 2>/dev/null || echo 0")"
+    pc_file_epoch="$(echo "${pc_file_epoch}" | tr -cd '0-9')"
+    if [[ -n "$pc_file_epoch" && "$pc_file_epoch" =~ ^[0-9]+$ && "$pc_file_epoch" -gt 0 ]]; then
       pc_age_days=$(( (now_epoch - pc_file_epoch) / 86400 ))
     else
       pc_age_days=999
     fi
+
     log "${ip}: arquivo '${fname}' -> ${pc_age_days} dia(s)."
     [[ $pc_age_days -le 7 ]] && pc_recent+=("$fname") || pc_old+=("$fname")
   done <<< "$raw_list"
@@ -780,7 +793,7 @@ chmod +x "${AUTO_DIR}/nsx_sb_precheck.sh"
 
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.16.3
+# nsx_sb_main.sh  — v3.16.4
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -981,7 +994,7 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.16.3
+# NSX Edge Automation — Manual de Uso  v3.16.4
 
 ## Scripts disponiveis
 
@@ -1019,13 +1032,12 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluido! v3.16.3"
+echo "  Deploy concluido! v3.16.4"
 echo "================================================================"
 echo ""
-echo "  FIX v3.16.3:"
-echo "    common.sh/_save_creds — senha com caracteres especiais"
-echo "    (%, !, $, \\) nao corrompe mais o arquivo de sessao."
-echo "    Cada campo gravado individualmente com printf '%s'."
+echo "  FIX v3.16.4:"
+echo "    nsx_sb_precheck.sh — idade do bundle calculada via stat mtime"
+echo "    no node remoto. Qualquer nome de arquivo agora e reconhecido."
 echo ""
 echo "Proximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./nsx_sb_precheck.sh"
