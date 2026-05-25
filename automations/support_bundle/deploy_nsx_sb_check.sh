@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.16.2
+# deploy_nsx_sb_check.sh  v3.16.3
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
+# CHANGELOG v3.16.3:
+#   - FIX: _save_creds usava printf com formato unico para os 3 campos.
+#     Senhas com caracteres especiais (%, !, $, \) eram corrompidas no
+#     arquivo de sessao. Corrigido para gravar cada campo individualmente
+#     com { printf '%s' "$val"; echo; } evitando qualquer interpretacao.
+#
 # CHANGELOG v3.16.2:
-#   - FIX: (( pc_total++ )) retorna exit 1 quando valor inicial e 0, causando
-#     abort silencioso com set -euo pipefail. Substituido por
-#     pc_total=$(( pc_total + 1 )) em todo o nsx_sb_precheck.sh.
+#   - FIX: (( pc_total++ )) -> pc_total=$(( pc_total + 1 ))
 #
 # CHANGELOG v3.16.1:
 #   - FIX: removido 'local' fora de funcao no loop for ip.
@@ -31,7 +35,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${AUTO_DIR}/.ssh_keys" "${LIB_DIR
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.16.2"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.16.3"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -68,11 +72,11 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.16
+# lib/common.sh  — v3.16.3
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.16
+# lib/common.sh  — v3.16.3
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -199,10 +203,18 @@ load_ips(){
   log "Loaded ${#EDGE_IPS[@]} Edge Node(s): ${EDGE_IPS[*]}"
 }
 
+# ---------------------------------------------------------------------------
+# _save_creds — FIX v3.16.3
+# Cada campo e gravado individualmente com printf '%s' para evitar que
+# caracteres especiais na senha (%, !, $, \) sejam interpretados pelo
+# formato do printf e corrompam o arquivo de sessao.
+# ---------------------------------------------------------------------------
 _save_creds(){
   ( umask 177
-    printf 'NSX_USER=%s\nNSX_PASS=%s\nROOT_PASS=%s\n' \
-      "${NSX_USER:-}" "${NSX_PASS:-}" "${ROOT_PASS:-}" > "${_CRED_FILE}" )
+    { printf 'NSX_USER='; printf '%s' "${NSX_USER:-}"; printf '\n'
+      printf 'NSX_PASS='; printf '%s' "${NSX_PASS:-}"; printf '\n'
+      printf 'ROOT_PASS='; printf '%s' "${ROOT_PASS:-}"; printf '\n'
+    } > "${_CRED_FILE}" )
   chmod 600 "${_CRED_FILE}"
 }
 
@@ -621,24 +633,9 @@ prompt_clear_creds
 TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
-# ---------------------------------------------------------------------------
-# nsx_sb_precheck.sh  — v3.16.2
-# FIX: (( pc_total++ )) -> pc_total=$(( pc_total + 1 ))  evita exit 1 quando valor=0 com set -e
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
 #!/usr/bin/env bash
-# nsx_sb_precheck.sh  — v3.16.2
-#
-# FIX v3.16.2:
-#   (( pc_total++ )) retorna exit code 1 quando o valor inicial e 0 (falso
-#   aritmetico no bash). Com set -euo pipefail isso mata o script antes de
-#   processar qualquer bundle. Corrigido para pc_total=$(( pc_total + 1 )).
-#
-# FIX v3.16.1: removido 'local' fora de funcao no loop for ip.
-#
-# USO:
-#   ./nsx_sb_precheck.sh
-#   ./nsx_sb_precheck.sh --clean-all
+# nsx_sb_precheck.sh  — v3.16.3
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -657,9 +654,6 @@ CLEAN_ALL=false
 declare -A PC_STATUS PC_ACAO PC_FILE PC_SKIP PC_DURACAO
 now_epoch=$(date +%s)
 
-# ---------------------------------------------------------------------------
-# bundle_duration — tempo entre solicitacao (nome do arquivo) e criacao (mtime)
-# ---------------------------------------------------------------------------
 bundle_duration(){
   local ip="$1" fname="$2" req_epoch="" created_epoch=""
   if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})\.tgz$ ]]; then
@@ -711,7 +705,6 @@ for ip in "${EDGE_IPS[@]}"; do
     continue
   fi
 
-  # Listar bundles — grep com || true garante exit 0 quando nao ha .tgz
   raw_list="$(root_cmd "$ip" "ls /var/vmware/nsx/file-store/ 2>/dev/null" | grep -E '\.tgz$' || true)"
   log "${ip}: [bundles detectados] resultado bruto: '${raw_list:-<vazio>}'"
 
@@ -720,8 +713,6 @@ for ip in "${EDGE_IPS[@]}"; do
 
   while IFS= read -r fname; do
     [[ -z "$fname" ]] && continue
-    # FIX v3.16.2: usar atribuicao aritmetica em vez de (( ++ )) para evitar
-    # exit code 1 quando pc_total=0 com set -e ativo
     pc_total=$(( pc_total + 1 ))
     pc_age_days=0
     if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_[0-9]{6}\.tgz$ ]]; then
@@ -764,9 +755,6 @@ for ip in "${EDGE_IPS[@]}"; do
   disable_root_ssh "$ip" || true
 done
 
-# ---------------------------------------------------------------------------
-# Relatorio final
-# ---------------------------------------------------------------------------
 precheck_csv="${LOG_DIR}/precheck_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,status,acao,arquivo,duracao' > "$precheck_csv"
 
@@ -790,12 +778,9 @@ prompt_clear_creds
 PRECHECK
 chmod +x "${AUTO_DIR}/nsx_sb_precheck.sh"
 
-# ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.16.2 (sem alteracoes funcionais)
-# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.16.2
+# nsx_sb_main.sh  — v3.16.3
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -996,7 +981,7 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.16.2
+# NSX Edge Automation — Manual de Uso  v3.16.3
 
 ## Scripts disponiveis
 
@@ -1034,12 +1019,13 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluido! v3.16.2"
+echo "  Deploy concluido! v3.16.3"
 echo "================================================================"
 echo ""
-echo "  FIX v3.16.2:"
-echo "    nsx_sb_precheck.sh — (( pc_total++ )) substituido por"
-echo "    pc_total=\$(( pc_total + 1 )) para evitar abort com set -e"
+echo "  FIX v3.16.3:"
+echo "    common.sh/_save_creds — senha com caracteres especiais"
+echo "    (%, !, $, \\) nao corrompe mais o arquivo de sessao."
+echo "    Cada campo gravado individualmente com printf '%s'."
 echo ""
 echo "Proximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./nsx_sb_precheck.sh"
