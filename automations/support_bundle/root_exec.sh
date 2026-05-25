@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# root_exec.sh — Run any Linux root command on selected or all Edge Nodes
-#                Enables root SSH before execution, disables after.
+# root_exec.sh — v3.16.6
+# Run any Linux root command on selected or all Edge Nodes.
+# Enables root SSH before execution, disables after.
 #
-# FIX v3.14: Comandos bloqueantes (ex: get support-bundle, tar, rsync longos)
+# FIX v3.16.6: Comandos bloqueantes (ex: get support-bundle, tar, rsync)
 # sao disparados em background com disown, evitando que o script fique preso.
-# O output e capturado em logs/root_exec_<ip>_<ts>.log.
+# Output capturado em logs/root_exec_<ip>_<ts>.log.
+# ROOT_PASS e solicitada uma unica vez e reusada para todos os nodes.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -23,7 +25,7 @@ read -rp 'Linux root command: '         CMD
 read -rp '[WARNING] Confirm root execution in production? [y/N]: ' CONFIRM
 [[ "${CONFIRM,,}" == "y" ]] || { echo "Cancelled."; exit 0; }
 
-# Detecta se o comando e bloqueante (longa duracao sem retornar prompt)
+# Detecta comandos de longa duracao que nao devolvem prompt
 _is_blocking_cmd(){
   local cmd="${1,,}"
   [[ "$cmd" =~ get[[:space:]]+support-bundle ]] || \
@@ -37,7 +39,7 @@ run(){
   echo "===== root@${ip} ====="
   enable_root_ssh "$ip"; sleep 2
 
-  # Obtem ROOT_PASS se necessario (uma unica vez fora do loop)
+  # Solicita ROOT_PASS uma unica vez para todos os nodes
   if [[ ! -f "${ROOT_KEY}" ]] && [[ -z "${ROOT_PASS:-}" ]]; then
     ask_root_creds
   fi

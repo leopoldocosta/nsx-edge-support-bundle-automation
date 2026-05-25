@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# admin_exec.sh — Run any NSX-T admin CLI command on selected or all Edge Nodes
+# admin_exec.sh — v3.16.6
+# Run any NSX-T admin CLI command on selected or all Edge Nodes.
 #
-# FIX v3.14: Comandos bloqueantes (ex: get support-bundle) sao disparados
-# em background com disown, evitando que o script fique preso aguardando.
-# O output e capturado em arquivo de log em logs/admin_exec_<ip>_<ts>.log.
-# Para comandos nao bloqueantes, o output continua sendo exibido inline.
+# FIX v3.16.6: Comandos bloqueantes (ex: get support-bundle, start support-bundle)
+# sao disparados em background com disown, evitando que o script fique preso
+# aguardando retorno do CLI NSX-T.
+# Output capturado em logs/admin_exec_<ip>_<ts>.log.
+# Comandos nao bloqueantes continuam exibindo output inline normalmente.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -22,8 +24,7 @@ read -rp 'Select node (number or A): ' SEL
 read -rp 'NSX-T admin CLI command: '   CMD
 echo ""
 
-# Detecta se o comando e bloqueante (ex: get support-bundle)
-# Comandos bloqueantes sao executados em background com log em arquivo.
+# Detecta comandos que bloqueiam o CLI NSX-T indefinidamente
 _is_blocking_cmd(){
   local cmd="${1,,}"
   [[ "$cmd" =~ get[[:space:]]+support-bundle ]] || \
