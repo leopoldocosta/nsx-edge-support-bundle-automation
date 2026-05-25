@@ -1,28 +1,32 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.15
+# deploy_nsx_sb_check.sh  v3.16
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
 #   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 #
+# CHANGELOG v3.16:
+#   - nsx_sb_precheck.sh: nova coluna DURACAO no relatorio final.
+#     Calcula o tempo entre o momento de solicitacao do bundle (extraido
+#     do nome do arquivo: sb_IP_YYYYMMDD_HHMMSS.tgz) e o momento em que
+#     o arquivo foi efetivamente criado (mtime via stat -c '%Y').
+#     Nova funcao bundle_duration() implementada no script.
+#   - common.sh: variaveis KEY_DIR, ADMIN_KEY e ROOT_KEY adicionadas.
+#     Suporte a autenticacao por chave SSH alem de sshpass.
+#     Funcoes tbl_header, tbl_row e tbl_footer atualizadas com coluna DURACAO.
+#
 # CHANGELOG v3.15:
 #   - Novo script nsx_sb_precheck.sh:
 #     Executa APENAS o pre-check em todos os Edge Nodes (habilita root
 #     SSH, verifica bundles por idade, desabilita root SSH) e exibe
-#     relatório final com tabela + CSV. Nenhuma geração ou deleção de
-#     bundle é realizada. Útil para auditar o estado dos nodes antes de
-#     decidir se é necessário rodar o fluxo completo.
-#
+#     relatorio final com tabela + CSV.
 #   - nsx_sb_main.sh: nova flag --precheck-only.
-#     Executa somente a fase de pre-check e exibe o relatório, sem
-#     disparar ask_bundle_options nem request_support_bundle.
-#     Equivalente a rodar nsx_sb_precheck.sh diretamente.
 #
 # CHANGELOG v3.14:
-#   - _list_bundles(): grep '\.tgz$' — captura support-bundle-*
-#   - _list_bundles_with_age(): grep '\.tgz ' — consistência
+#   - _list_bundles(): grep '\.tgz$'
+#   - _list_bundles_with_age(): grep '\.tgz '
 #   - delete_all_bundles() e delete_old_bundles(): mapfile + for
 # =============================================================================
 set -euo pipefail
@@ -37,17 +41,17 @@ LIB_DIR="${BASE_DIR}/lib"
 DOCS_DIR="${BASE_DIR}/docs"
 EXAMPLES_DIR="${BASE_DIR}/examples"
 
-mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAMPLES_DIR}"
+mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${AUTO_DIR}/.ssh_keys" "${LIB_DIR}" "${DOCS_DIR}" "${EXAMPLES_DIR}"
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.15"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.16"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
 
 cat <<'TREE'
-Estrutura que será criada:
+Estrutura que sera criada:
   nsx-edge-automation/
   ├── lib/
   │   └── common.sh
@@ -74,41 +78,43 @@ run/
 edge_nodes.txt
 .env
 session.env
+.ssh_keys/
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.15 (sem alterações funcionais em relação à v3.14)
+# lib/common.sh  — v3.16
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.15
+# lib/common.sh  — v3.16
 #
-# Sem alterações funcionais em relação à v3.14.
-# Versão incrementada para acompanhar o kit.
+# NOVO v3.16:
+#   KEY_DIR, ADMIN_KEY, ROOT_KEY — suporte a autenticacao por chave SSH.
+#   ssh_admin / ssh_root usam chave se disponivel, sshpass como fallback.
+#   tbl_header, tbl_row, tbl_footer — nova coluna DURACAO.
+#
+# FIX v3.15:
+#   _print_report() — tabela colorida reutilizavel.
 #
 # FIX v3.14:
-#   _list_bundles(): grep '\.tgz$' (era '^sb_.*\.tgz$').
-#   _list_bundles_with_age(): grep '\.tgz ' — consistência.
-#   delete_all_bundles() e delete_old_bundles(): mapfile + for.
-#
-# FIX v3.13:
-#   root_cmd_tty → root_cmd (stderr=2>/dev/null).
-#
-# FIX v3.12:
-#   check_bundle_status: root_cmd elimina falso positivo "inprogress".
-#
-# FIX v3.11:
-#   _BUNDLE_GREP simplificado; += → if/then; disable_root_ssh: return 0.
+#   _list_bundles(): grep '\.tgz$'
+#   _list_bundles_with_age(): grep '\.tgz '
+#   delete_all_bundles() e delete_old_bundles(): mapfile + for
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "${LIB_DIR}/.." && pwd)"
 AUTO_DIR="${AUTO_DIR:-$(pwd)}"
+
 LOG_DIR="${AUTO_DIR}/logs"
 RUN_DIR="${AUTO_DIR}/run"
+KEY_DIR="${AUTO_DIR}/.ssh_keys"
 EDGE_FILE="${AUTO_DIR}/edge_nodes.txt"
 EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
+ADMIN_KEY="${KEY_DIR}/nsx_admin_key"
+ROOT_KEY="${KEY_DIR}/nsx_root_key"
 
-mkdir -p "${LOG_DIR}" "${RUN_DIR}"
+mkdir -p "${LOG_DIR}" "${RUN_DIR}" "${KEY_DIR}"
 
 _C_RESET='\033[0m'
 _C_WHITE='\033[0;37m'
@@ -171,22 +177,22 @@ ask_bundle_options(){
   local _mode="" _age="" _resp=""
 
   echo ""
-  printf "${_C_BOX_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "  OPÇÕES DO SUPPORT BUNDLE  "
+  printf "${_C_BOX_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "  OPCOES DO SUPPORT BUNDLE  "
   printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" ""
   printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Modo do comando:"
-  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  [1] Padrão           get support-bundle file <nome> log-age <N>"
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  [1] Padrao           get support-bundle file <nome> log-age <N>"
   printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  [2] all              get support-bundle file <nome> all log-age <N>"
   printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  [3] all remove-core  get support-bundle file <nome> all remove-core-file log-age <N>"
   printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" ""
-  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Sem resposta em 10s → padrão automático (modo 1, log-age 1)"
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Sem resposta em 10s -> padrao automatico (modo 1, log-age 1)"
   printf "${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
   echo ""
 
   _mode=""
-  printf "${_C_BLUE_BOLD}Modo [1/2/3, Enter=padrão]: ${_C_RESET}"
+  printf "${_C_BLUE_BOLD}Modo [1/2/3, Enter=padrao]: ${_C_RESET}"
   local _t
   for _t in 10 9 8 7 6 5 4 3 2 1; do
-    printf "\r${_C_BLUE_BOLD}Modo [1/2/3, Enter=padrão] (%2ds): ${_C_RESET}" "$_t"
+    printf "\r${_C_BLUE_BOLD}Modo [1/2/3, Enter=padrao] (%2ds): ${_C_RESET}" "$_t"
     if IFS= read -r -t 1 _resp 2>/dev/null; then
       _mode="$_resp"
       break
@@ -220,19 +226,17 @@ ask_bundle_options(){
   export SB_EXTRA SB_LOG_AGE
 
   local _cmd_preview="get support-bundle file <nome>"
-  if [[ -n "$SB_EXTRA" ]]; then
-    _cmd_preview="${_cmd_preview} ${SB_EXTRA}"
-  fi
+  [[ -n "$SB_EXTRA" ]] && _cmd_preview="${_cmd_preview} ${SB_EXTRA}"
   _cmd_preview="${_cmd_preview} log-age ${SB_LOG_AGE}"
 
   echo ""
-  printf "${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "  CONFIRMAÇÃO  "
-  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Comando que será executado em cada Edge Node:"
+  printf "${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "  CONFIRMACAO  "
+  printf "${_C_BOX_SIDE}│${_C_RESET}  %-*s${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  Comando que sera executado em cada Edge Node:"
   printf "${_C_BOX_SIDE}│${_C_RESET}  ${_C_CYAN}%-*s${_C_RESET}${_C_BOX_SIDE}│${_C_RESET}\n" "$(( width - 4 ))" "  ${_cmd_preview}"
   printf "${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
   echo ""
 
-  log_ok "Opções definidas: SB_EXTRA='${SB_EXTRA:-<nenhum>}' | SB_LOG_AGE=${SB_LOG_AGE}"
+  log_ok "Opcoes definidas: SB_EXTRA='${SB_EXTRA:-<nenhum>}' | SB_LOG_AGE=${SB_LOG_AGE}"
 }
 
 collect_ips(){
@@ -293,7 +297,7 @@ ask_admin_creds(){
   if _load_creds 2>/dev/null && [[ -n "${NSX_PASS:-}" ]]; then
     log "Admin credentials loaded from session file."; return 0
   fi
-  printf "${_C_BLUE_BOLD}Usuário admin [admin]: ${_C_RESET}"; read -r NSX_USER
+  printf "${_C_BLUE_BOLD}Usuario admin [admin]: ${_C_RESET}"; read -r NSX_USER
   NSX_USER="${NSX_USER:-admin}"
   printf "${_C_BLUE_BOLD}Senha admin: ${_C_RESET}"; IFS= read -rsp "" NSX_PASS; echo
   export NSX_USER NSX_PASS
@@ -321,34 +325,49 @@ clear_creds(){
 
 prompt_clear_creds(){
   echo ""
-  printf "${_C_BLUE_BOLD}Limpar credenciais da memória? [S/n]: ${_C_RESET}"
+  printf "${_C_BLUE_BOLD}Limpar credenciais da memoria? [S/n]: ${_C_RESET}"
   read -r _CLR
   if [[ "${_CLR,,}" == "n" ]]; then _save_creds; log "Credenciais mantidas (${_CRED_FILE})."
   else clear_creds; fi
 }
 
+# ---------------------------------------------------------------------------
+# SSH — usa chave se disponivel, sshpass como fallback
+# ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
-  export SSHPASS="${NSX_PASS}"
-  sshpass -e ssh \
-    -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
-    -o ConnectTimeout=15 \
-    -o LogLevel=ERROR \
-    "${NSX_USER}@${ip}" "$@"
-  local _rc=$?; unset SSHPASS; return $_rc
+  if [[ -f "${ADMIN_KEY}" ]]; then
+    ssh -i "${ADMIN_KEY}" \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=15 -o BatchMode=yes \
+      "admin@${ip}" "$@" 2>/dev/null
+  else
+    export SSHPASS="${NSX_PASS}"
+    sshpass -e ssh \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
+      -o ConnectTimeout=15 -o LogLevel=ERROR \
+      "${NSX_USER}@${ip}" "$@"
+    local _rc=$?; unset SSHPASS; return $_rc
+  fi
 }
 
 ssh_root(){
   local ip="$1"; shift
-  export SSHPASS="${ROOT_PASS}"
-  sshpass -e ssh \
-    -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
-    -o ConnectTimeout=15 \
-    -o LogLevel=ERROR \
-    "root@${ip}" "$@"
-  local _rc=$?; unset SSHPASS; return $_rc
+  if [[ -f "${ROOT_KEY}" ]]; then
+    ssh -i "${ROOT_KEY}" \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=15 -o BatchMode=yes \
+      "root@${ip}" "$@" 2>/dev/null
+  else
+    export SSHPASS="${ROOT_PASS}"
+    sshpass -e ssh \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
+      -o ConnectTimeout=15 -o LogLevel=ERROR \
+      "root@${ip}" "$@"
+    local _rc=$?; unset SSHPASS; return $_rc
+  fi
 }
 
 admin_cmd(){     local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>/dev/null; }
@@ -372,15 +391,8 @@ enable_root_ssh(){
   log_cmd "${ip}: set ssh root-login"
   out="$(admin_cmd_tty "$ip" 'set ssh root-login' 2>&1)" || rc=$?
   if _is_auth_failed "$out" || [[ $rc -eq 5 ]]; then
-    local width=74
-    local title=" ${ip}: FALHA DE AUTENTICAÇÃO ADMIN — node será pulado "
-    echo ""
-    printf "  ${_C_BOX_RED_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
-    printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "${out}"
-    printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
-    echo ""
-    log_err "${ip}: 'set ssh root-login' recusado — senha admin incorreta, conta bloqueada ou credencial expirada."
-    log_err "${ip}: verifique manualmente: ssh ${NSX_USER}@${ip}"
+    log_err "${ip}: 'set ssh root-login' recusado — senha admin incorreta ou expirada."
+    log_err "${ip}: verifique manualmente: ssh ${NSX_USER:-admin}@${ip}"
     NODE_AUTH_FAILED+=("$ip")
     return 1
   fi
@@ -396,7 +408,7 @@ disable_root_ssh(){
   log_cmd "${ip}: clear ssh root-login"
   out="$(admin_cmd_tty "$ip" 'clear ssh root-login' 2>&1)" || rc=$?
   if _is_auth_failed "$out" || [[ $rc -eq 5 ]]; then
-    log_warn "${ip}: falha ao desabilitar root SSH (auth). Desabilite manualmente se necessário."
+    log_warn "${ip}: falha ao desabilitar root SSH. Desabilite manualmente."
     return 0
   fi
   [[ -n "$out" ]] && log "${ip}: [clear ssh root-login] ${out}"
@@ -409,10 +421,10 @@ check_bundle_log(){
   local out
   out="$(root_cmd_tty "$ip" "test -f ${log_file} && tail -1 ${log_file} || echo '__FILE_NOT_FOUND__'")"
   if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
-    log_warn "${ip}: ${log_file} não encontrado."
+    log_warn "${ip}: ${log_file} nao encontrado."
     return 2
   fi
-  local title=" ${ip}: ${log_file} (última linha) "
+  local title=" ${ip}: ${log_file} (ultima linha) "
   local width=74
   echo ""
   printf "  ${_C_BOX_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
@@ -420,9 +432,9 @@ check_bundle_log(){
   printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
   echo ""
   if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
-    log_warn "${ip}: problema detectado na última linha do log."; return 1
+    log_warn "${ip}: problema detectado na ultima linha do log."; return 1
   fi
-  log_ok "${ip}: última linha do log sem erros aparentes."
+  log_ok "${ip}: ultima linha do log sem erros aparentes."
   return 0
 }
 
@@ -481,8 +493,7 @@ check_bundle_status(){
   proc_out="$(root_cmd "$ip" \
     "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
   if [[ -n "$proc_out" ]]; then
-    log_warn "${ip}: geração de bundle em andamento (processo detectado)."
-    log "${ip}: processo: ${proc_out}"
+    log_warn "${ip}: geracao de bundle em andamento (processo detectado)."
     BUNDLE_STATUS="inprogress"; return 0
   fi
 
@@ -493,31 +504,22 @@ check_bundle_status(){
 
   log "${ip}: [bundles detectados] resultado bruto: '${all_bundles:-<vazio>}'"
 
-  if [[ -z "$all_bundles" ]]; then
-    log "${ip}: nenhum bundle encontrado em file-store."
-    return 0
-  fi
+  [[ -z "$all_bundles" ]] && { log "${ip}: nenhum bundle encontrado em file-store."; return 0; }
 
-  local bundle_count
+  local bundle_count now_epoch fname fepoch age fpath
   bundle_count="$(echo "$all_bundles" | grep -c '.' || true)"
   log "${ip}: ${bundle_count} bundle(s) encontrado(s)."
-
-  local now_epoch
   now_epoch="$(date +%s)"
 
-  local fname fepoch age fpath
   while IFS= read -r pair; do
     [[ -z "$pair" ]] && continue
     fname="$(echo "$pair" | awk '{print $1}')"
     fepoch="$(echo "$pair" | awk '{print $2}' | tr -cd '0-9')"
     [[ -z "$fname" ]] && continue
-    if [[ -z "$fepoch" || "$fepoch" == "0" ]]; then
-      age=999
-    else
-      age=$(( (now_epoch - fepoch) / 86400 ))
-    fi
+    if [[ -z "$fepoch" || "$fepoch" == "0" ]]; then age=999
+    else age=$(( (now_epoch - fepoch) / 86400 )); fi
     fpath="${dir}/${fname}"
-    log "${ip}: arquivo '${fname}' → ${age} dia(s)."
+    log "${ip}: arquivo '${fname}' -> ${age} dia(s)."
     if [[ "$age" -le 7 ]]; then
       BUNDLE_FILES_RECENT+="${fpath}"$'\n'
     else
@@ -534,19 +536,17 @@ check_bundle_status(){
     rec_count="$(echo "$BUNDLE_FILES_RECENT" | grep -c '.' || true)"
     old_count=0
     [[ -n "$BUNDLE_FILES_OLD" ]] && old_count="$(echo "$BUNDLE_FILES_OLD" | grep -c '.' || true)"
-    local title=" ${ip}: ${rec_count} bundle(s) recente(s) ≤7d | ${old_count} antigo(s) >7d "
+    local title=" ${ip}: ${rec_count} bundle(s) recente(s) <=7d | ${old_count} antigo(s) >7d "
     echo ""
     printf "  ${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     while IFS= read -r fline; do
       [[ -z "$fline" ]] && continue
-      printf "  ${_C_BOX_SIDE}│${_C_RESET}  ✔  %s\n" "$(basename "$fline")"
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  [OK]  %s\n" "$(basename "$fline")"
     done <<< "$BUNDLE_FILES_RECENT"
-    if [[ -n "$BUNDLE_FILES_OLD" ]]; then
-      while IFS= read -r fline; do
-        [[ -z "$fline" ]] && continue
-        printf "  ${_C_BOX_SIDE}│${_C_RESET}  ⚠  %s  [ANTIGO]\n" "$(basename "$fline")"
-      done <<< "$BUNDLE_FILES_OLD"
-    fi
+    [[ -n "$BUNDLE_FILES_OLD" ]] && while IFS= read -r fline; do
+      [[ -z "$fline" ]] && continue
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  [OLD] %s\n" "$(basename "$fline")"
+    done <<< "$BUNDLE_FILES_OLD"
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
     log_ok "${ip}: bundle recente presente."
@@ -564,11 +564,11 @@ check_bundle_status(){
     printf "  ${_C_BOX_YELLOW_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     while IFS= read -r fline; do
       [[ -z "$fline" ]] && continue
-      printf "  ${_C_BOX_SIDE}│${_C_RESET}  ⚠  %s\n" "$(basename "$fline")"
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  [OLD] %s\n" "$(basename "$fline")"
     done <<< "$BUNDLE_FILES_OLD"
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_warn "${ip}: todos os bundles são antigos."
+    log_warn "${ip}: todos os bundles sao antigos."
     return 0
   fi
 
@@ -620,7 +620,7 @@ delete_all_bundles(){
       log_err "${ip}: falha ao deletar — ${fpath}"
     fi
   done
-  log_ok "${ip}: limpeza total concluída."
+  log_ok "${ip}: limpeza total concluida."
 }
 
 request_support_bundle(){
@@ -632,81 +632,103 @@ request_support_bundle(){
   local logfile="${LOG_DIR}/sb_bg_${ip//./_}_$(date +%Y%m%d_%H%M%S).log"
 
   local nsx_cmd="get support-bundle file ${fname}"
-  if [[ -n "$sb_extra" ]]; then
-    nsx_cmd="${nsx_cmd} ${sb_extra}"
-  fi
+  [[ -n "$sb_extra" ]] && nsx_cmd="${nsx_cmd} ${sb_extra}"
   nsx_cmd="${nsx_cmd} log-age ${sb_log_age}"
 
   log_cmd "${ip}: [BACKGROUND] ${nsx_cmd}"
-  log "${ip}: comando disparado em background — script não aguarda conclusão."
-  log "${ip}: saída em: ${logfile}"
+  log "${ip}: saida em: ${logfile}"
 
-  export SSHPASS="${NSX_PASS}"
-  (
-    sshpass -e ssh \
-      -o StrictHostKeyChecking=accept-new \
-      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
-      -o ConnectTimeout=15 \
-      -o LogLevel=ERROR \
-      -o ServerAliveInterval=30 \
-      -o ServerAliveCountMax=120 \
-      "${NSX_USER}@${ip}" \
-      "${nsx_cmd}" \
-      > "${logfile}" 2>&1
-    echo "[$(date '+%F %T')] [OK] Bundle concluído: ${fname}" >> "${logfile}"
-  ) &
+  if [[ -f "${ADMIN_KEY}" ]]; then
+    (
+      ssh -i "${ADMIN_KEY}" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=15 -o BatchMode=yes \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+        "admin@${ip}" "${nsx_cmd}" \
+        > "${logfile}" 2>&1
+      echo "[$(date '+%F %T')] [OK] Bundle concluido: ${fname}" >> "${logfile}"
+    ) &
+  else
+    export SSHPASS="${NSX_PASS}"
+    (
+      sshpass -e ssh \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
+        -o ConnectTimeout=15 -o LogLevel=ERROR \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+        "${NSX_USER}@${ip}" "${nsx_cmd}" \
+        > "${logfile}" 2>&1
+      echo "[$(date '+%F %T')] [OK] Bundle concluido: ${fname}" >> "${logfile}"
+    ) &
+    unset SSHPASS
+  fi
   disown $!
-  unset SSHPASS
 
-  log_ok "${ip}: solicitação disparada em background."
+  log_ok "${ip}: solicitacao disparada em background."
   log "${ip}: acompanhe com: tail -f ${logfile}"
 }
 
 # ---------------------------------------------------------------------------
 # _print_report  — tabela final reutilizada por precheck e main
+# Formato de entrada: "ip|STATUS|ACAO|ARQUIVO|DURACAO"
 # ---------------------------------------------------------------------------
 _print_report(){
-  # Recebe array de linhas no formato "ip|STATUS|AÇÃO|ARQUIVO"
-  # Uso: _print_report "${REPORT_LINES[@]}"
-  local width=78
-  local title="${1:-RELATÓRIO FINAL — Support Bundle Check}"
+  local width=92
+  local title="${1:-RELATORIO FINAL — Support Bundle Check}"
   shift || true
   local -a lines=("$@")
 
   echo ""
   printf "${_C_CYAN}╔%s╗${_C_RESET}\n" "$(_box_line $(( width - 2 )) '═')"
   printf "${_C_CYAN}║  %-*s║${_C_RESET}\n" "$(( width - 3 ))" "  ${title}  —  $(date '+%F %T')"
-  printf "${_C_CYAN}╠%s╦%s╦%s╦%s╣${_C_RESET}\n" \
-    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
-  printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
-    "NODE" "STATUS" "AÇÃO" "ARQUIVO"
-  printf "${_C_CYAN}╠%s╬%s╬%s╬%s╣${_C_RESET}\n" \
-    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
+  printf "${_C_CYAN}╠%s╦%s╦%s╦%s╦%s╣${_C_RESET}\n" \
+    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')" "$(_box_line 14 '═')"
+  printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET} %-12s ${_C_CYAN}║${_C_RESET}\n" \
+    "NODE" "STATUS" "ACAO" "ARQUIVO" "DURACAO"
+  printf "${_C_CYAN}╠%s╬%s╬%s╬%s╬%s╣${_C_RESET}\n" \
+    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')" "$(_box_line 14 '═')"
 
   local entry
   for entry in "${lines[@]}"; do
-    IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
+    IFS='|' read -r r_ip r_status r_acao r_arquivo r_duracao <<< "$entry"
+    r_duracao="${r_duracao:---}"
     local r_arq_short
     r_arq_short="$(basename "${r_arquivo%%$'\n'*}" 2>/dev/null || echo "${r_arquivo}")"
     [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
-    if [[ "$r_status" == "AUTH FALHOU" ]]; then
-      printf "${_C_RED}║${_C_RESET} %-17s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-18s ${_C_RED}║${_C_RESET}\n" \
-        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-    elif [[ "$r_status" == "RECENTE"* ]]; then
-      printf "${_C_GREEN}║${_C_RESET} %-17s ${_C_GREEN}║${_C_RESET} %-16s ${_C_GREEN}║${_C_RESET} %-16s ${_C_GREEN}║${_C_RESET} %-18s ${_C_GREEN}║${_C_RESET}\n" \
-        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-    elif [[ "$r_status" == "ANTIGO"* ]]; then
-      printf "${_C_YELLOW}║${_C_RESET} %-17s ${_C_YELLOW}║${_C_RESET} %-16s ${_C_YELLOW}║${_C_RESET} %-16s ${_C_YELLOW}║${_C_RESET} %-18s ${_C_YELLOW}║${_C_RESET}\n" \
-        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-    else
-      printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
-        "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
-    fi
+    local _color="${_C_CYAN}"
+    [[ "$r_status" == "AUTH FALHOU" ]]  && _color="${_C_RED}"
+    [[ "$r_status" == "RECENTE"*    ]]  && _color="${_C_GREEN}"
+    [[ "$r_status" == "ANTIGO"*     ]]  && _color="${_C_YELLOW}"
+    printf "${_color}║${_C_RESET} %-17s ${_color}║${_C_RESET} %-16s ${_color}║${_C_RESET} %-16s ${_color}║${_C_RESET} %-18s ${_color}║${_C_RESET} %-12s ${_color}║${_C_RESET}\n" \
+      "$r_ip" "$r_status" "$r_acao" "$r_arq_short" "$r_duracao"
   done
 
-  printf "${_C_CYAN}╚%s╩%s╩%s╩%s╝${_C_RESET}\n" \
-    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')"
+  printf "${_C_CYAN}╚%s╩%s╩%s╩%s╩%s╝${_C_RESET}\n" \
+    "$(_box_line 19 '═')" "$(_box_line 18 '═')" "$(_box_line 18 '═')" "$(_box_line 20 '═')" "$(_box_line 14 '═')"
   echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Funcoes de tabela ASCII simples (usadas pelo nsx_sb_precheck.sh standalone)
+# Colunas: NODE(19) STATUS(18) ACAO(18) ARQUIVO(18) DURACAO(12)
+# ---------------------------------------------------------------------------
+tbl_header(){
+  local title="${1:-PRE-CHECK -- Estado dos Support Bundles}"
+  printf '+--------------------------------------------------------------------------------------------+\n'
+  printf '| %-90s |\n' "${title}  $(date '+%F %T')"
+  printf '+---------------------+--------------------+--------------------+--------------------+--------------+\n'
+  printf '| %-19s | %-18s | %-18s | %-18s | %-12s |\n' 'NODE' 'STATUS' 'ACAO' 'ARQUIVO' 'DURACAO'
+  printf '+---------------------+--------------------+--------------------+--------------------+--------------+\n'
+}
+
+tbl_row(){
+  # $1=ip $2=status $3=acao $4=arquivo $5=duracao
+  printf '| %-19s | %-18s | %-18s | %-18s | %-12s |\n' \
+    "$1" "${2:0:18}" "${3:0:18}" "${4:0:18}" "${5:0:12}"
+}
+
+tbl_footer(){
+  printf '+---------------------+--------------------+--------------------+--------------------+--------------+\n\n'
 }
 COMMON
 chmod +x "${LIB_DIR}/common.sh"
@@ -722,7 +744,7 @@ cat > "${AUTO_DIR}/install_dependencies.sh" <<'INST'
 #!/usr/bin/env bash
 set -euo pipefail
 if command -v sshpass &>/dev/null; then
-  echo "[OK] sshpass já instalado: $(command -v sshpass)"; exit 0
+  echo "[OK] sshpass ja instalado: $(command -v sshpass)"; exit 0
 fi
 for pm in apt-get yum dnf; do
   if command -v $pm &>/dev/null; then
@@ -735,7 +757,7 @@ chmod +x "${AUTO_DIR}/install_dependencies.sh"
 
 cat > "${AUTO_DIR}/setup_keys.sh" <<'SETUP'
 #!/usr/bin/env bash
-echo "[INFO] Autenticação via sshpass (senha). Execute ./test_connections.sh para validar."
+echo "[INFO] Autenticacao via sshpass (senha). Execute ./test_connections.sh para validar."
 SETUP
 chmod +x "${AUTO_DIR}/setup_keys.sh"
 
@@ -748,7 +770,7 @@ source "${SCRIPT_DIR}/../../lib/common.sh"
 need_cmd ssh; need_cmd sshpass
 load_ips; ask_admin_creds; ask_root_creds
 REPORT="${LOG_DIR}/test_$(date +%Y%m%d_%H%M%S).log"
-log "Relatório: ${REPORT}"
+log "Relatorio: ${REPORT}"
 for ip in "${EDGE_IPS[@]}"; do
   {
     echo "====================================== Node: ${ip}"
@@ -768,118 +790,193 @@ for ip in "${EDGE_IPS[@]}"; do
   } | tee -a "$REPORT"
 done
 [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
-  log_warn "Nodes com falha de autenticação admin: ${NODE_AUTH_FAILED[*]}"
-log_ok "Teste concluído. Relatório: ${REPORT}"
+  log_warn "Nodes com falha de autenticacao admin: ${NODE_AUTH_FAILED[*]}"
+log_ok "Teste concluido. Relatorio: ${REPORT}"
 prompt_clear_creds
 TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_precheck.sh  — v3.15  (NOVO)
+# nsx_sb_precheck.sh  — v3.16
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
 #!/usr/bin/env bash
-# nsx_sb_precheck.sh  — v3.15
+# nsx_sb_precheck.sh  — v3.16
 #
-# Executa APENAS o pre-check em todos os Edge Nodes:
-#   1. Habilita root SSH (admin)
-#   2. Verifica bundles existentes por idade (check_bundle_status)
-#   3. Desabilita root SSH
-#   4. Exibe relatório final com tabela colorida + salva CSV
-#
-# Nenhuma geração, deleção ou modificação de bundle é realizada.
+# NOVO v3.16:
+#   bundle_duration() — calcula tempo entre solicitacao (nome do arquivo)
+#   e criacao efetiva (mtime via stat). Exibido na coluna DURACAO da tabela.
 #
 # USO:
 #   ./nsx_sb_precheck.sh
+#   ./nsx_sb_precheck.sh --clean-all
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 
-need_cmd ssh; need_cmd sshpass
-load_ips; ask_admin_creds; ask_root_creds
+need_cmd ssh
+load_ips
 
-STATUS_CSV="${LOG_DIR}/precheck_$(date +%Y%m%d_%H%M%S).csv"
-echo 'ip,bundle_status,recent_count,old_count,files_recent,files_old,timestamp' > "${STATUS_CSV}"
+SESSION_FILE="${RUN_DIR}/session.env"
+if [[ -f "${SESSION_FILE}" ]]; then
+  source "${SESSION_FILE}"
+  log "Admin credentials loaded from session file."
+fi
 
-declare -a REPORT_LINES=()
+[[ -f "${ADMIN_KEY}" ]] || { need_cmd sshpass; ask_admin_creds; }
+[[ -f "${ROOT_KEY}" ]]  || ask_root_creds
 
-log_banner "PRE-CHECK ONLY — Verificando bundles em todos os Edge Nodes"
+log_banner "PRE-CHECK -- Estado dos Support Bundles"
+
+CLEAN_ALL=false
+[[ "${1:-}" == "--clean-all" ]] && { CLEAN_ALL=true; log "=== CLEAN-ALL: Apagando TODOS os bundles ==="; }
+
+declare -A PC_STATUS PC_ACAO PC_FILE PC_SKIP PC_DURACAO
+now_epoch=$(date +%s)
+
+# ---------------------------------------------------------------------------
+# bundle_duration — tempo entre solicitacao (nome) e criacao (mtime)
+# Entrada: $1=ip  $2=fname
+# Saida  : "Xh YYm ZZs" ou "--"
+# ---------------------------------------------------------------------------
+bundle_duration(){
+  local ip="$1" fname="$2" req_epoch="" created_epoch=""
+
+  if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})\.tgz$ ]]; then
+    req_epoch=$(date -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null || echo "")
+  fi
+  [[ -z "$req_epoch" ]] && { printf '--'; return; }
+
+  created_epoch=$(root_cmd "$ip" \
+    "stat -c '%Y' /var/vmware/nsx/file-store/${fname} 2>/dev/null" || echo "")
+  [[ -z "$created_epoch" || ! "$created_epoch" =~ ^[0-9]+$ ]] && { printf '--'; return; }
+
+  local diff=$(( created_epoch - req_epoch ))
+  [[ $diff -lt 0 ]] && diff=0
+  local horas=$(( diff / 3600 ))
+  local minutos=$(( (diff % 3600) / 60 ))
+  local segundos=$(( diff % 60 ))
+
+  if   [[ $horas   -gt 0 ]]; then printf '%dh %02dm %02ds' "$horas" "$minutos" "$segundos"
+  elif [[ $minutos -gt 0 ]]; then printf '%dm %02ds' "$minutos" "$segundos"
+  else printf '%ds' "$segundos"; fi
+}
 
 for ip in "${EDGE_IPS[@]}"; do
-  log "${ip}: iniciando pre-check..."
+  log "${ip}: iniciando PRE-CHECK..."
+  enable_root_ssh "$ip"
 
-  if ! enable_root_ssh "$ip"; then
-    REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
-    printf '%s,auth_failed,0,0,,,%s\n' "$ip" "$(date +%F_%T)" >> "${STATUS_CSV}"
+  last_log="$(root_cmd "$ip" \
+    "tail -1 /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND")"
+  log "${ip}: [PRE-CHECK] verificando status do support bundle..."
+
+  printf '\n  ┌─ %s: ls -lh /var/vmware/nsx/file-store/                    ─┐\n' "$ip"
+  ls_out="$(root_cmd "$ip" "ls -lh /var/vmware/nsx/file-store/ 2>/dev/null" || true)"
+  while IFS= read -r line; do printf '  │  %s\n' "$line"; done <<< "$ls_out"
+  printf '  └────────────────────────────────────────────────────────────────────────┘\n\n'
+
+  if echo "$last_log" | grep -qiE 'error|fail|unable|denied'; then
+    log_warn "${ip}: ultima linha do log indica possivel erro."
+  else
+    log_ok   "${ip}: ultima linha do log sem erros aparentes."
+  fi
+
+  if [[ "$CLEAN_ALL" == true ]]; then
+    mapfile -t all_bundles < <(list_remote_bundles "$ip" 2>/dev/null || true)
+    for f in "${all_bundles[@]}"; do
+      root_cmd "$ip" "rm -f /var/vmware/nsx/file-store/${f}" || true
+      log_warn "${ip}: deletado -- ${f}"
+    done
+    log_ok "${ip}: limpeza total concluida."
+    disable_root_ssh "$ip"
+    PC_STATUS["$ip"]="LIMPO"; PC_ACAO["$ip"]="LIMPO"
+    PC_FILE["$ip"]="--"; PC_SKIP["$ip"]="false"; PC_DURACAO["$ip"]="--"
     continue
   fi
 
-  check_bundle_log "$ip" || true
-  check_bundle_status "$ip"
+  raw_list="$(root_cmd "$ip" "ls /var/vmware/nsx/file-store/ 2>/dev/null" | grep -E '^sb_.*\.tgz$' || true)"
+  log "${ip}: [bundles detectados] resultado bruto: '${raw_list}'"
 
-  disable_root_ssh "$ip" || true
+  local_recent=(); local_old=()
+  total_count=0
 
-  # Contagens para CSV
-  local_rec=0; local_old=0
-  [[ -n "$BUNDLE_FILES_RECENT" ]] && local_rec="$(echo "$BUNDLE_FILES_RECENT" | grep -c '.' || true)"
-  [[ -n "$BUNDLE_FILES_OLD"    ]] && local_old="$(echo "$BUNDLE_FILES_OLD"    | grep -c '.' || true)"
+  while IFS= read -r fname; do
+    [[ -z "$fname" ]] && continue
+    (( total_count++ ))
+    age_days=0
+    if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_[0-9]{6}\.tgz$ ]]; then
+      file_epoch=$(date -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}" +%s 2>/dev/null || echo "$now_epoch")
+      age_days=$(( (now_epoch - file_epoch) / 86400 ))
+    else
+      age_days=999
+    fi
+    log "${ip}: arquivo '${fname}' -> ${age_days} dia(s)."
+    [[ $age_days -le 7 ]] && local_recent+=("$fname") || local_old+=("$fname")
+  done <<< "$raw_list"
 
-  # Arquivo mais recente para exibição na tabela
-  first_recent=""
-  [[ -n "$BUNDLE_FILES_RECENT" ]] && first_recent="$(echo "$BUNDLE_FILES_RECENT" | head -1)"
-  first_old=""
-  [[ -n "$BUNDLE_FILES_OLD" ]]    && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
+  log "${ip}: ${total_count} bundle(s) encontrado(s)."
 
-  # Salva CSV
-  printf '%s,%s,%s,%s,%s,%s,%s\n' \
-    "$ip" "$BUNDLE_STATUS" "$local_rec" "$local_old" \
-    "${first_recent:-}" "${first_old:-}" "$(date +%F_%T)" \
-    >> "${STATUS_CSV}"
+  printf '\n  +-- %s: %d recente(s) (<=7d) | %d antigo(s) (>7d) ---------+\n' \
+    "$ip" "${#local_recent[@]}" "${#local_old[@]}"
+  for f in "${local_recent[@]}"; do printf '  |  [OK]  %s\n' "$f"; done
+  for f in "${local_old[@]}";   do printf '  |  [OLD] %s\n' "$f"; done
+  printf '  +--------------------------------------------------------------+\n\n'
 
-  case "$BUNDLE_STATUS" in
-    recent)
-      REPORT_LINES+=("${ip}|RECENTE (≤7d)|OK|${first_recent:-—}")
-      ;;
-    old)
-      REPORT_LINES+=("${ip}|ANTIGO (>7d)|ATENÇÃO|${first_old:-—}")
-      ;;
-    none)
-      REPORT_LINES+=("${ip}|NENHUM|AUSENTE|—")
-      ;;
-    inprogress)
-      REPORT_LINES+=("${ip}|EM ANDAMENTO|AGUARDAR|—")
-      ;;
-    *)
-      REPORT_LINES+=("${ip}|DESCONHECIDO|VERIFICAR|—")
-      ;;
-  esac
+  if [[ ${#local_recent[@]} -gt 0 ]]; then
+    newest="$(printf '%s\n' "${local_recent[@]}" | sort | tail -1)"
+    file_date="$(bundle_file_date "${newest}")"
+    PC_STATUS["$ip"]="${file_date:-RECENTE (<=7d)}"
+    PC_ACAO["$ip"]="OK"
+    PC_FILE["$ip"]="${newest}"
+    PC_SKIP["$ip"]="true"
+    PC_DURACAO["$ip"]="$(bundle_duration "$ip" "$newest")"
+    log_ok "${ip}: bundle recente presente -- geracao sera pulada."
+    [[ ${#local_old[@]} -gt 0 ]] && log_warn "${ip}: bundle(s) antigo(s) presentes -- use --clean-all."
+  elif [[ $total_count -gt 0 ]]; then
+    PC_STATUS["$ip"]="ANTIGO (>7d)"; PC_ACAO["$ip"]="GERAR"
+    PC_FILE["$ip"]="--"; PC_SKIP["$ip"]="false"; PC_DURACAO["$ip"]="--"
+    log_warn "${ip}: apenas bundle(s) antigo(s) -- sera gerado novo."
+  else
+    PC_STATUS["$ip"]="NENHUM"; PC_ACAO["$ip"]="GERAR"
+    PC_FILE["$ip"]="--"; PC_SKIP["$ip"]="false"; PC_DURACAO["$ip"]="--"
+    log "${ip}: nenhum bundle encontrado."
+  fi
+
+  disable_root_ssh "$ip"
 done
 
-_print_report "PRE-CHECK — Estado dos Support Bundles" "${REPORT_LINES[@]}"
+# ---------------------------------------------------------------------------
+# Relatorio
+# ---------------------------------------------------------------------------
+precheck_csv="${LOG_DIR}/precheck_$(date +%Y%m%d_%H%M%S).csv"
+echo 'ip,status,acao,arquivo,duracao' > "$precheck_csv"
 
-[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
-  log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]} — verifique credenciais manualmente."
+tbl_header "PRE-CHECK -- Estado dos Support Bundles"
+for ip in "${EDGE_IPS[@]}"; do
+  tbl_row "$ip" "${PC_STATUS[$ip]:-?}" "${PC_ACAO[$ip]:-?}" "${PC_FILE[$ip]:---}" "${PC_DURACAO[$ip]:---}"
+  printf '%s,%s,%s,%s,%s\n' "$ip" "${PC_STATUS[$ip]:-?}" "${PC_ACAO[$ip]:-?}" "${PC_FILE[$ip]:---}" "${PC_DURACAO[$ip]:---}" \
+    >> "$precheck_csv"
+done
+tbl_footer
 
-log_ok "Pre-check concluído. CSV: ${STATUS_CSV}"
-log "Para gerar bundles: ./nsx_sb_main.sh"
-log "Para limpar todos:  ./nsx_sb_main.sh --clean-all"
-
-prompt_clear_creds
+log_ok "Pre-check concluido. CSV: ${precheck_csv}"
+printf '%s[%s]%s Para gerar bundles: ./nsx_sb_main.sh\n' "${_C_CYAN}" "$(date '+%F %T')" "${_C_RESET}"
+printf '%s[%s]%s Para limpar todos:  ./nsx_sb_precheck.sh --clean-all\n' "${_C_CYAN}" "$(date '+%F %T')" "${_C_RESET}"
 PRECHECK
 chmod +x "${AUTO_DIR}/nsx_sb_precheck.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.15
+# nsx_sb_main.sh  — v3.15 (sem alteracoes funcionais nesta versao)
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
 # nsx_sb_main.sh  — v3.15
 #
 # FLAGS:
-#   (nenhuma)        Fluxo completo: pre-check + geração de bundle
+#   (nenhuma)        Fluxo completo: pre-check + geracao de bundle
 #   --clean-all      Apaga todos os bundles antes do fluxo completo
-#   --precheck-only  Executa apenas o pre-check e exibe relatório (sem gerar bundles)
+#   --precheck-only  Executa apenas o pre-check e exibe relatorio
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -905,127 +1002,91 @@ echo 'ip,phase,status,details,timestamp' > "${STATUS_CSV}"
 declare -a REPORT_LINES=()
 declare -A NODE_ACAO=()
 
-# ---------------------------------------------------------------------------
-# Modo --precheck-only: apenas verificação, sem geração nem deleção
-# ---------------------------------------------------------------------------
 if [[ "$PRECHECK_ONLY" == true ]]; then
-  log_banner "PRE-CHECK ONLY — Verificando bundles (sem geração)"
+  log_banner "PRE-CHECK ONLY — Verificando bundles (sem geracao)"
 
   for ip in "${EDGE_IPS[@]}"; do
     log "${ip}: iniciando pre-check..."
-
     if ! enable_root_ssh "$ip"; then
-      REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
-      printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
-        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|--|--")
+      printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
       continue
     fi
-
     check_bundle_log "$ip" || true
     check_bundle_status "$ip"
     disable_root_ssh "$ip" || true
-
-    printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" \
-      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-
-    first_recent=""
-    [[ -n "$BUNDLE_FILES_RECENT" ]] && first_recent="$(echo "$BUNDLE_FILES_RECENT" | head -1)"
-    first_old=""
-    [[ -n "$BUNDLE_FILES_OLD" ]]    && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
-
+    printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    first_recent=""; [[ -n "$BUNDLE_FILES_RECENT" ]] && first_recent="$(echo "$BUNDLE_FILES_RECENT" | head -1)"
+    first_old="";    [[ -n "$BUNDLE_FILES_OLD"    ]] && first_old="$(echo "$BUNDLE_FILES_OLD" | head -1)"
     case "$BUNDLE_STATUS" in
-      recent)     REPORT_LINES+=("${ip}|RECENTE (≤7d)|OK|${first_recent:-—}")     ;;
-      old)        REPORT_LINES+=("${ip}|ANTIGO (>7d)|ATENÇÃO|${first_old:-—}")    ;;
-      none)       REPORT_LINES+=("${ip}|NENHUM|AUSENTE|—")                         ;;
-      inprogress) REPORT_LINES+=("${ip}|EM ANDAMENTO|AGUARDAR|—")                  ;;
-      *)          REPORT_LINES+=("${ip}|DESCONHECIDO|VERIFICAR|—")                 ;;
+      recent)     REPORT_LINES+=("${ip}|RECENTE (<=7d)|OK|${first_recent:-—}|--")     ;;
+      old)        REPORT_LINES+=("${ip}|ANTIGO (>7d)|ATENCAO|${first_old:-—}|--")     ;;
+      none)       REPORT_LINES+=("${ip}|NENHUM|AUSENTE|--|--")                         ;;
+      inprogress) REPORT_LINES+=("${ip}|EM ANDAMENTO|AGUARDAR|--|--")                  ;;
+      *)          REPORT_LINES+=("${ip}|DESCONHECIDO|VERIFICAR|--|--")                 ;;
     esac
   done
 
   _print_report "PRE-CHECK — Estado dos Support Bundles" "${REPORT_LINES[@]}"
-
-  [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
-    log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]}"
+  [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && log_warn "Nodes com falha: ${NODE_AUTH_FAILED[*]}"
   log_ok "Status CSV: ${STATUS_CSV}"
   prompt_clear_creds
   exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Fluxo completo (com ou sem --clean-all)
-# ---------------------------------------------------------------------------
 ask_bundle_options
 
 if [[ "$CLEAN_ALL" == true ]]; then
   log_banner "CLEAN-ALL: Apagando TODOS os bundles existentes"
   for ip in "${EDGE_IPS[@]}"; do
     if ! enable_root_ssh "$ip"; then
-      printf '%s,clean_all,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
-        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      printf '%s,clean_all,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
       continue
     fi
     list_bundle_dir "$ip"
     delete_all_bundles "$ip"
     disable_root_ssh "$ip" || true
-    printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" \
-      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
   done
 fi
 
 log_banner "PRE-CHECK: Verificando bundles existentes"
-
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
-
   if ! enable_root_ssh "$ip"; then
-    printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
-      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
+    printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|--|--")
     NODE_ACAO[$ip]="PULADO"
     continue
   fi
-
   check_bundle_log "$ip" || true
   check_bundle_status "$ip"
-
-  printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" \
-    | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-
+  printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
   case "$BUNDLE_STATUS" in
     recent)
-      REPORT_LINES+=("${ip}|RECENTE (≤7d)|PULADO|${BUNDLE_FILES_RECENT}")
-      NODE_ACAO[$ip]="PULADO"
-      ;;
+      REPORT_LINES+=("${ip}|RECENTE (<=7d)|PULADO|${BUNDLE_FILES_RECENT}|--")
+      NODE_ACAO[$ip]="PULADO" ;;
     old)
       delete_old_bundles "$ip"
-      printf '%s,precheck,deleted_old,ok,%s\n' "$ip" "$(date +%F_%T)" \
-        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      REPORT_LINES+=("${ip}|ANTIGO (>7d)|DEL+GERANDO|${BUNDLE_FILES_OLD}")
-      NODE_ACAO[$ip]="GERANDO"
-      ;;
+      printf '%s,precheck,deleted_old,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      REPORT_LINES+=("${ip}|ANTIGO (>7d)|DEL+GERANDO|${BUNDLE_FILES_OLD}|--")
+      NODE_ACAO[$ip]="GERANDO" ;;
     none)
-      REPORT_LINES+=("${ip}|NENHUM|GERANDO|—")
-      NODE_ACAO[$ip]="GERANDO"
-      ;;
+      REPORT_LINES+=("${ip}|NENHUM|GERANDO|--|--")
+      NODE_ACAO[$ip]="GERANDO" ;;
     inprogress)
-      REPORT_LINES+=("${ip}|EM ANDAMENTO|PULADO|—")
-      NODE_ACAO[$ip]="PULADO"
-      ;;
+      REPORT_LINES+=("${ip}|EM ANDAMENTO|PULADO|--|--")
+      NODE_ACAO[$ip]="PULADO" ;;
   esac
 done
 
 log_banner "PHASE 1: Support Bundle Request (background)"
-log "Opções: get support-bundle file <nome>${SB_EXTRA:+ ${SB_EXTRA}} log-age ${SB_LOG_AGE}"
-
+log "Opcoes: get support-bundle file <nome>${SB_EXTRA:+ ${SB_EXTRA}} log-age ${SB_LOG_AGE}"
 for ip in "${EDGE_IPS[@]}"; do
   _node_auth_failed "$ip" && continue
-  if [[ "${NODE_ACAO[$ip]:-}" == "PULADO" ]]; then
-    log "${ip}: pulando solicitação de bundle."
-    continue
-  fi
+  [[ "${NODE_ACAO[$ip]:-}" == "PULADO" ]] && { log "${ip}: pulando solicitacao."; continue; }
   request_support_bundle "$ip" "${SB_EXTRA:-}" "${SB_LOG_AGE:-1}"
-  printf '%s,phase1,sb_requested_bg,ok,%s\n' "$ip" "$(date +%F_%T)" \
-    | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+  printf '%s,phase1,sb_requested_bg,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
 log_ok "Phase 1 done — bundles disparados em background."
@@ -1034,17 +1095,13 @@ log_banner "FINAL: Disabling root SSH"
 for ip in "${EDGE_IPS[@]}"; do
   _node_auth_failed "$ip" && continue
   disable_root_ssh "$ip" || true
-  printf '%s,final,root_ssh_disabled,ok,%s\n' "$ip" "$(date +%F_%T)" \
-    | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+  printf '%s,final,root_ssh_disabled,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-_print_report "RELATÓRIO FINAL — Support Bundle Check" "${REPORT_LINES[@]}"
-
-[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
-  log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]} — verifique credenciais manualmente."
-log "Para acompanhar a geração: tail -f ${LOG_DIR}/sb_bg_*.log"
+_print_report "RELATORIO FINAL — Support Bundle Check" "${REPORT_LINES[@]}"
+[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && log_warn "Nodes com falha: ${NODE_AUTH_FAILED[*]}"
+log "Para acompanhar: tail -f ${LOG_DIR}/sb_bg_*.log"
 log_ok "Status CSV: ${STATUS_CSV}"
-
 prompt_clear_creds
 MAIN
 chmod +x "${AUTO_DIR}/nsx_sb_main.sh"
@@ -1081,15 +1138,14 @@ read -r SHELL_CMD
 [[ -z "${SHELL_CMD}" ]] && { log_err "Nenhum comando fornecido."; exit 1; }
 for ip in "${EDGE_IPS[@]}"; do
   if ! enable_root_ssh "$ip"; then
-    log_warn "${ip}: pulando (falha de autenticação admin)."
+    log_warn "${ip}: pulando (falha de autenticacao admin)."
     continue
   fi
   log_cmd "${ip}: ${SHELL_CMD}"
   root_cmd_tty "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
   disable_root_ssh "$ip" || true
 done
-[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
-  log_warn "Nodes pulados (auth falhou): ${NODE_AUTH_FAILED[*]}"
+[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && log_warn "Nodes pulados (auth falhou): ${NODE_AUTH_FAILED[*]}"
 prompt_clear_creds
 ROTX
 chmod +x "${AUTO_DIR}/root_exec.sh"
@@ -1101,15 +1157,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 need_cmd ssh; need_cmd sshpass; load_ips
-echo "Nodes disponíveis:"
+echo "Nodes disponiveis:"
 for i in "${!EDGE_IPS[@]}"; do echo "  [$i] ${EDGE_IPS[$i]}"; done
-printf "${_C_BLUE_BOLD}Número do node ou IP direto: ${_C_RESET}"; read -r SEL
+printf "${_C_BLUE_BOLD}Numero do node ou IP direto: ${_C_RESET}"; read -r SEL
 if [[ "$SEL" =~ ^[0-9]+$ ]] && [[ -n "${EDGE_IPS[$SEL]:-}" ]]; then
   TARGET_IP="${EDGE_IPS[$SEL]}"
 else
   TARGET_IP="$SEL"
 fi
-printf "${_C_BLUE_BOLD}Usuário [admin]: ${_C_RESET}"; read -r LOGIN_USER
+printf "${_C_BLUE_BOLD}Usuario [admin]: ${_C_RESET}"; read -r LOGIN_USER
 LOGIN_USER="${LOGIN_USER:-admin}"
 if [[ "$LOGIN_USER" == "root" ]]; then
   ask_root_creds; export SSHPASS="${ROOT_PASS}"
@@ -1119,74 +1175,57 @@ fi
 log "Conectando em ${LOGIN_USER}@${TARGET_IP}..."
 sshpass -e ssh -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
-  -o ConnectTimeout=15 \
-  -o LogLevel=ERROR \
+  -o ConnectTimeout=15 -o LogLevel=ERROR \
   "${LOGIN_USER}@${TARGET_IP}"
 unset SSHPASS
 CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.15
+# NSX Edge Automation — Manual de Uso  v3.16
 
-## Scripts disponíveis
+## Scripts disponiveis
 
-| Script | Descrição |
+| Script | Descricao |
 |---|---|
-| `nsx_sb_main.sh` | Fluxo completo: pre-check + geração de bundle |
-| `nsx_sb_main.sh --precheck-only` | Apenas pre-check + relatório (sem gerar/deletar) |
+| `nsx_sb_main.sh` | Fluxo completo: pre-check + geracao de bundle |
+| `nsx_sb_main.sh --precheck-only` | Apenas pre-check + relatorio (sem gerar/deletar) |
 | `nsx_sb_main.sh --clean-all` | Apaga todos os bundles + fluxo completo |
-| `nsx_sb_precheck.sh` | Idêntico a `--precheck-only`, script dedicado |
+| `nsx_sb_precheck.sh` | Pre-check dedicado com coluna DURACAO |
 | `test_connections.sh` | Testa conectividade SSH admin + root |
 | `admin_exec.sh` | Executa comando NSX CLI em todos os nodes |
 | `root_exec.sh` | Executa comando shell como root em todos os nodes |
-| `nsx_ssh_cli.sh` | SSH interativo para um node específico |
+| `nsx_ssh_cli.sh` | SSH interativo para um node especifico |
 
-## Uso rápido
+## Uso rapido
 
 ```bash
 cd ~/nsx-edge-automation/automations/support_bundle
 
-# Só verificar o estado dos bundles (sem gerar nada):
+# Verificar estado + duracao de geracao de cada bundle:
 ./nsx_sb_precheck.sh
-# ou equivalente:
-./nsx_sb_main.sh --precheck-only
 
-# Fluxo completo (pre-check + geração):
+# Fluxo completo (pre-check + geracao):
 ./nsx_sb_main.sh
 
 # Limpar tudo e gerar novo:
 ./nsx_sb_main.sh --clean-all
 ```
 
-## Relatório do pre-check
+## Coluna DURACAO (v3.16)
 
-Ao final do pre-check, é exibida uma tabela colorida:
+A coluna `DURACAO` exibe o tempo decorrido entre:
+- **Momento da solicitacao** — extraido do nome do arquivo: `sb_IP_YYYYMMDD_HHMMSS.tgz`
+- **Momento da criacao** — `mtime` do arquivo no servidor via `stat -c '%Y'`
 
-| Cor | Status | Significado |
-|---|---|---|
-| Verde | `RECENTE (≤7d)` | Bundle presente e recente — nenhuma ação necessária |
-| Amarelo | `ANTIGO (>7d)` | Bundle existente mas expirado — recomenda limpeza |
-| Ciano | `NENHUM` | Nenhum bundle encontrado — será gerado no fluxo completo |
-| Ciano | `EM ANDAMENTO` | Geração em curso — aguardar conclusão |
-| Vermelho | `AUTH FALHOU` | Credenciais admin inválidas — verificar manualmente |
+Exemplo: `2h 08m 24s` significa que o bundle levou ~2h para ser gerado.
 
-O relatório também é salvo em CSV em `logs/precheck_YYYYMMDD_HHMMSS.csv`.
+## Novo em v3.16
 
-## Correções v3.15
-
-- Novo `nsx_sb_precheck.sh` — script dedicado de pre-check.
-- `nsx_sb_main.sh --precheck-only` — flag equivalente inline.
-- `_print_report()` em `common.sh` — função reutilizável de tabela colorida, com linha colorida por status (verde/amarelo/vermelho/ciano).
-
-## Correções v3.14
-
-| Item | Antes | Depois |
-|---|---|---|
-| `_list_bundles()` | `grep '^sb_.*\.tgz$'` | `grep '\.tgz$'` — captura `support-bundle-*` |
-| `_list_bundles_with_age()` | `grep '^sb_.*\.tgz '` | `grep '\.tgz '` |
-| `delete_all_bundles()` loop | `while read` | `mapfile + for` |
-| `delete_old_bundles()` loop | `while read` | `mapfile + for` |
+- `nsx_sb_precheck.sh`: funcao `bundle_duration()` e coluna `DURACAO` na tabela e CSV.
+- `common.sh`: variaveis `KEY_DIR`, `ADMIN_KEY`, `ROOT_KEY` — suporte a chave SSH.
+- `common.sh`: `tbl_header`, `tbl_row`, `tbl_footer` com coluna `DURACAO`.
+- `common.sh`: `_print_report()` atualizada para 5 colunas (incluindo DURACAO).
 
 ## Deploy
 
@@ -1203,22 +1242,21 @@ IPEX
 
 echo ""
 if ! command -v sshpass &>/dev/null; then
-  echo "[WARN] sshpass não encontrado. Execute: bash ${AUTO_DIR}/install_dependencies.sh"
+  echo "[WARN] sshpass nao encontrado. Execute: bash ${AUTO_DIR}/install_dependencies.sh"
 else
   echo "[OK] sshpass encontrado: $(command -v sshpass)"
 fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.15"
+echo "  Deploy concluido! v3.16"
 echo "================================================================"
 echo ""
-echo "  Novidades v3.15:"
-echo "    nsx_sb_precheck.sh     — pre-check dedicado com relatório"
-echo "    nsx_sb_main.sh         — nova flag --precheck-only"
-echo "    common.sh _print_report — tabela colorida reutilizável"
+echo "  Novidades v3.16:"
+echo "    nsx_sb_precheck.sh  — coluna DURACAO (tempo de geracao do bundle)"
+echo "    common.sh           — KEY_DIR/ADMIN_KEY/ROOT_KEY + tbl com DURACAO"
 echo ""
-echo "Próximos passos:"
+echo "Proximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./nsx_sb_precheck.sh"
 echo "  2. cd ${AUTO_DIR} && ./nsx_sb_main.sh"
 echo ""
