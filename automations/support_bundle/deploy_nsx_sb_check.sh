@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.16.5
+# deploy_nsx_sb_check.sh  v3.16.6
 # Deploy local do kit NSX Edge Automation - Support Bundle
+#
+# CHANGELOG v3.16.6:
+#   - FIX: admin_exec.sh e root_exec.sh agora detectam comandos bloqueantes
+#     (get/start support-bundle, tar, rsync) e os disparam em background
+#     com disown, evitando que o script fique preso aguardando retorno do
+#     CLI NSX-T. Output capturado em logs/admin_exec_<ip>_<ts>.log e
+#     logs/root_exec_<ip>_<ts>.log respectivamente.
+#     Comandos normais continuam com output inline.
+#     ROOT_PASS solicitada uma unica vez (root_exec).
 #
 # CHANGELOG v3.16.5:
 #   - FIX: bundle_duration em nsx_sb_precheck.sh.
@@ -44,7 +53,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${AUTO_DIR}/.ssh_keys" "${LIB_DIR
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation - Support Bundle Kit  v3.16.5"
+echo "  NSX Edge Automation - Support Bundle Kit  v3.16.6"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -81,11 +90,11 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  -- v3.16.5
+# lib/common.sh  -- v3.16.6
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  -- v3.16.5
+# lib/common.sh  -- v3.16.6
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -638,21 +647,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_precheck.sh  -- v3.16.5
-#
-# FIX v3.16.5: bundle_duration
-#   Antes: printf '%dh %02dm %02ds' "$horas" "$minutos" "$segundos"
-#   O bash nativo rejeita variaveis nao-numericas com:
-#     printf: usage: printf [-v var] format [arguments]
-#   Causa: diff negativo (created_epoch < req_epoch), valor vazio ou
-#   nao-inteiro em horas/minutos/segundos.
-#   Correcao: validar diff >= 0 e que horas/minutos/segundos sao
-#   inteiros [0-9]+ antes de qualquer printf com %d/%02d.
-#   Se invalido, retorna '--' de forma segura.
+# nsx_sb_precheck.sh  -- v3.16.6 (sem alteracoes funcionais desde v3.16.5)
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
 #!/usr/bin/env bash
-# nsx_sb_precheck.sh  -- v3.16.5
+# nsx_sb_precheck.sh  -- v3.16.6
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -673,39 +672,32 @@ now_epoch=$(date +%s)
 
 # ---------------------------------------------------------------------------
 # bundle_duration IP FNAME
-# Calcula duracao da geracao: mtime(arquivo) - timestamp_no_nome.
 # FIX v3.16.5: valida todos os valores numericos antes de printf %d.
-# Retorna '--' em qualquer caso de valor invalido/nao-numerico.
 # ---------------------------------------------------------------------------
 bundle_duration(){
   local ip="$1" fname="$2"
   local req_epoch="" created_epoch="" diff=0
   local horas=0 minutos=0 segundos=0
 
-  # Tenta extrair timestamp do nome: *_YYYYMMDD_HHMMSS.tgz
   if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})\.tgz$ ]]; then
     req_epoch=$(date -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null || echo "")
   fi
-  # Sem timestamp no nome: nao e possivel calcular duracao
   [[ -z "$req_epoch" || ! "$req_epoch" =~ ^[0-9]+$ ]] && { printf '--'; return 0; }
 
-  # Obtem mtime real do arquivo no node
   created_epoch=$(root_cmd "$ip" \
     "stat -c '%Y' /var/vmware/nsx/file-store/${fname} 2>/dev/null" 2>/dev/null || echo "")
   created_epoch="$(printf '%s' "${created_epoch}" | tr -cd '0-9')"
   [[ -z "$created_epoch" || ! "$created_epoch" =~ ^[0-9]+$ ]] && { printf '--'; return 0; }
 
   diff=$(( created_epoch - req_epoch ))
-  # diff negativo indica clock skew ou nome incorreto: retorna '--'
   [[ $diff -lt 0 ]] && { printf '--'; return 0; }
 
   horas=$(( diff / 3600 ))
   minutos=$(( (diff % 3600) / 60 ))
   segundos=$(( diff % 60 ))
 
-  # Validacao final: garante que sao inteiros antes do printf numerico
-  if [[ ! "$horas"   =~ ^[0-9]+$ ]] || \
-     [[ ! "$minutos" =~ ^[0-9]+$ ]] || \
+  if [[ ! "$horas"    =~ ^[0-9]+$ ]] || \
+     [[ ! "$minutos"  =~ ^[0-9]+$ ]] || \
      [[ ! "$segundos" =~ ^[0-9]+$ ]]; then
     printf '--'; return 0
   fi
@@ -758,7 +750,6 @@ for ip in "${EDGE_IPS[@]}"; do
     [[ -z "$fname" ]] && continue
     pc_total=$(( pc_total + 1 ))
 
-    # FIX v3.16.4: usar mtime real via stat no node
     pc_file_epoch="$(root_cmd "$ip" \
       "stat -c '%Y' /var/vmware/nsx/file-store/${fname} 2>/dev/null || echo 0")"
     pc_file_epoch="$(printf '%s' "${pc_file_epoch}" | tr -cd '0-9')"
@@ -827,7 +818,7 @@ chmod +x "${AUTO_DIR}/nsx_sb_precheck.sh"
 
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  -- v3.16.5
+# nsx_sb_main.sh  -- v3.16.6
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -952,45 +943,191 @@ prompt_clear_creds
 MAIN
 chmod +x "${AUTO_DIR}/nsx_sb_main.sh"
 
+# ---------------------------------------------------------------------------
+# admin_exec.sh  -- v3.16.6
+# FIX: comandos bloqueantes (get/start support-bundle) disparados em
+# background com disown. Output em logs/admin_exec_<ip>_<ts>.log.
+# Comandos normais continuam com output inline.
+# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/admin_exec.sh" <<'ADMX'
 #!/usr/bin/env bash
+# admin_exec.sh -- v3.16.6
+# Run any NSX-T admin CLI command on selected or all Edge Nodes.
+#
+# FIX v3.16.6: Comandos bloqueantes (get/start support-bundle) sao disparados
+# em background com disown, evitando que o script fique preso aguardando o
+# CLI NSX-T. Output capturado em logs/admin_exec_<ip>_<ts>.log.
+# Comandos normais continuam com output inline.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 need_cmd ssh; need_cmd sshpass
 load_ips; ask_admin_creds
-printf "${_C_BLUE_BOLD}Comando NSX CLI para executar em todos os nodes: ${_C_RESET}"
-read -r NSX_CMD
+
+echo ""
+echo "Edge Nodes:"
+for i in "${!EDGE_IPS[@]}"; do printf '  [%d] %s\n' "$((i+1))" "${EDGE_IPS[$i]}"; done
+echo "  [A] All nodes"
+echo ""
+read -rp 'Select node (number or A): ' SEL
+read -rp 'NSX-T admin CLI command: '   NSX_CMD
+echo ""
+
 [[ -z "${NSX_CMD}" ]] && { log_err "Nenhum comando fornecido."; exit 1; }
-for ip in "${EDGE_IPS[@]}"; do
-  log_cmd "${ip}: ${NSX_CMD}"
+
+# Detecta comandos que bloqueiam o CLI NSX-T indefinidamente
+_is_blocking_cmd(){
+  local cmd="${1,,}"
+  [[ "$cmd" =~ get[[:space:]]+support-bundle ]] || \
+  [[ "$cmd" =~ start[[:space:]]+support-bundle ]]
+}
+
+run_inline(){
+  local ip="$1"
+  echo "===== admin@${ip} ====="
   admin_cmd_tty "$ip" "${NSX_CMD}" || log_warn "${ip}: comando retornou erro"
-done
+  echo
+}
+
+run_background(){
+  local ip="$1"
+  local ts; ts="$(date +%Y%m%d_%H%M%S)"
+  local logfile="${LOG_DIR}/admin_exec_${ip//./_}_${ts}.log"
+  echo "===== admin@${ip} [BACKGROUND] ====="
+  log "${ip}: comando bloqueante detectado -- disparando em background."
+  log "${ip}: output em: ${logfile}"
+  if [[ -f "${ADMIN_KEY}" ]]; then
+    ( ssh -i "${ADMIN_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=15 -o BatchMode=yes \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+        "admin@${ip}" "${NSX_CMD}" > "${logfile}" 2>&1
+      echo "[$(date '+%F %T')] [OK] Comando concluido: ${NSX_CMD}" >> "${logfile}" ) &
+  else
+    export SSHPASS="${NSX_PASS}"
+    ( sshpass -e ssh -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="${_KNOWN_HOSTS}" -o ConnectTimeout=15 -o LogLevel=ERROR \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+        "${NSX_USER}@${ip}" "${NSX_CMD}" > "${logfile}" 2>&1
+      echo "[$(date '+%F %T')] [OK] Comando concluido: ${NSX_CMD}" >> "${logfile}" ) &
+    unset SSHPASS
+  fi
+  disown $!
+  log_ok "${ip}: processo iniciado. Acompanhe com: tail -f ${logfile}"
+  echo
+}
+
+run(){
+  local ip="$1"
+  if _is_blocking_cmd "${NSX_CMD}"; then
+    run_background "$ip"
+  else
+    run_inline "$ip"
+  fi
+}
+
+if   [[ "${SEL^^}" == "A" ]]; then
+  for ip in "${EDGE_IPS[@]}"; do run "$ip"; done
+elif [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= ${#EDGE_IPS[@]} )); then
+  run "${EDGE_IPS[$((SEL-1))]}"
+else
+  echo "[ERROR] Invalid selection."; exit 1
+fi
+
 prompt_clear_creds
 ADMX
 chmod +x "${AUTO_DIR}/admin_exec.sh"
 
+# ---------------------------------------------------------------------------
+# root_exec.sh  -- v3.16.6
+# FIX: comandos bloqueantes (get/start support-bundle, tar, rsync) disparados
+# em background com disown. Output em logs/root_exec_<ip>_<ts>.log.
+# ROOT_PASS solicitada uma unica vez para todos os nodes.
+# ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/root_exec.sh" <<'ROTX'
 #!/usr/bin/env bash
+# root_exec.sh -- v3.16.6
+# Run any Linux root command on selected or all Edge Nodes.
+# Enables root SSH before execution, disables after.
+#
+# FIX v3.16.6: Comandos bloqueantes (get/start support-bundle, tar, rsync)
+# sao disparados em background com disown. Output em logs/root_exec_<ip>_<ts>.log.
+# ROOT_PASS solicitada uma unica vez para todos os nodes.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 need_cmd ssh; need_cmd sshpass
 load_ips; ask_admin_creds; ask_root_creds
-printf "${_C_BLUE_BOLD}Comando shell para executar como root: ${_C_RESET}"
-read -r SHELL_CMD
+
+echo ""
+echo "Edge Nodes:"
+for i in "${!EDGE_IPS[@]}"; do printf '  [%d] %s\n' "$((i+1))" "${EDGE_IPS[$i]}"; done
+echo "  [A] All nodes"
+echo ""
+read -rp 'Select node (number or A): ' SEL
+read -rp 'Linux root command: '         SHELL_CMD
+read -rp '[WARNING] Confirm root execution in production? [y/N]: ' CONFIRM
+[[ "${CONFIRM,,}" == "y" ]] || { echo "Cancelled."; exit 0; }
+
 [[ -z "${SHELL_CMD}" ]] && { log_err "Nenhum comando fornecido."; exit 1; }
-for ip in "${EDGE_IPS[@]}"; do
+
+# Detecta comandos de longa duracao que nao devolvem prompt
+_is_blocking_cmd(){
+  local cmd="${1,,}"
+  [[ "$cmd" =~ get[[:space:]]+support-bundle ]] || \
+  [[ "$cmd" =~ start[[:space:]]+support-bundle ]] || \
+  [[ "$cmd" =~ ^tar[[:space:]] ]] || \
+  [[ "$cmd" =~ ^rsync[[:space:]] ]]
+}
+
+run(){
+  local ip="$1"
   if ! enable_root_ssh "$ip"; then
     log_warn "${ip}: pulando (falha de autenticacao admin)."
-    continue
+    return 0
   fi
-  log_cmd "${ip}: ${SHELL_CMD}"
-  root_cmd_tty "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
+
+  echo "===== root@${ip} ====="
+
+  if _is_blocking_cmd "${SHELL_CMD}"; then
+    local ts; ts="$(date +%Y%m%d_%H%M%S)"
+    local logfile="${LOG_DIR}/root_exec_${ip//./_}_${ts}.log"
+    log "${ip}: comando bloqueante detectado -- disparando em background."
+    log "${ip}: output em: ${logfile}"
+    if [[ -f "${ROOT_KEY}" ]]; then
+      ( ssh -i "${ROOT_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o ConnectTimeout=15 -o BatchMode=yes \
+          -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+          "root@${ip}" "${SHELL_CMD}" > "${logfile}" 2>&1
+        echo "[$(date '+%F %T')] [OK] Comando concluido: ${SHELL_CMD}" >> "${logfile}" ) &
+    else
+      export SSHPASS="${ROOT_PASS}"
+      ( sshpass -e ssh -o StrictHostKeyChecking=accept-new \
+          -o UserKnownHostsFile="${_KNOWN_HOSTS}" -o ConnectTimeout=15 -o LogLevel=ERROR \
+          -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+          "root@${ip}" "${SHELL_CMD}" > "${logfile}" 2>&1
+        echo "[$(date '+%F %T')] [OK] Comando concluido: ${SHELL_CMD}" >> "${logfile}" ) &
+      unset SSHPASS
+    fi
+    disown $!
+    log_ok "${ip}: processo iniciado. Acompanhe com: tail -f ${logfile}"
+  else
+    root_cmd_tty "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
+  fi
+
   disable_root_ssh "$ip" || true
-done
+  echo
+}
+
+if   [[ "${SEL^^}" == "A" ]]; then
+  for ip in "${EDGE_IPS[@]}"; do run "$ip"; done
+elif [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= ${#EDGE_IPS[@]} )); then
+  run "${EDGE_IPS[$((SEL-1))]}"
+else
+  echo "[ERROR] Invalid selection."; exit 1
+fi
+
 [[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && log_warn "Nodes pulados: ${NODE_AUTH_FAILED[*]}"
 prompt_clear_creds
 ROTX
@@ -1028,7 +1165,7 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation -- Manual de Uso  v3.16.5
+# NSX Edge Automation -- Manual de Uso  v3.16.6
 
 ## Scripts disponiveis
 
@@ -1040,9 +1177,34 @@ cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
 | `nsx_sb_main.sh --precheck-only` | Apenas pre-check inline |
 | `nsx_sb_main.sh --clean-all` | Apaga tudo + fluxo completo |
 | `test_connections.sh` | Testa conectividade SSH admin + root |
-| `admin_exec.sh` | Executa comando NSX CLI em todos os nodes |
-| `root_exec.sh` | Executa comando shell como root |
+| `admin_exec.sh` | Executa comando NSX CLI (bloqueantes em background) |
+| `root_exec.sh` | Executa comando shell como root (bloqueantes em background) |
 | `nsx_ssh_cli.sh` | SSH interativo para um node especifico |
+
+## admin_exec / root_exec -- Comandos Bloqueantes
+
+Comandos como `get support-bundle` travam o CLI NSX-T durante toda a geracao
+do bundle (pode levar de 10 a 30 minutos). Para evitar que o script pare:
+
+- `admin_exec.sh` e `root_exec.sh` detectam automaticamente comandos
+  bloqueantes e os disparam em **background** com `disown`.
+- O output e capturado em `logs/admin_exec_<ip>_<ts>.log` ou
+  `logs/root_exec_<ip>_<ts>.log`.
+- O script retorna imediatamente e processa o proximo node.
+
+### Comandos detectados como bloqueantes
+
+| Script | Padroes |
+|---|---|
+| `admin_exec.sh` | `get support-bundle`, `start support-bundle` |
+| `root_exec.sh` | `get support-bundle`, `start support-bundle`, `tar ...`, `rsync ...` |
+
+### Acompanhar execucao em background
+
+```bash
+tail -f logs/admin_exec_*.log
+tail -f logs/root_exec_*.log
+```
 
 ## Deploy
 
@@ -1066,13 +1228,14 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluido! v3.16.5"
+echo "  Deploy concluido! v3.16.6"
 echo "================================================================"
 echo ""
-echo "  FIX v3.16.5:"
-echo "    nsx_sb_precheck.sh/bundle_duration -- validacao numerica"
-echo "    antes de printf '%dh %02dm %02ds'. Elimina erro:"
-echo "      printf: usage: printf [-v var] format [arguments]"
+echo "  FIX v3.16.6:"
+echo "    admin_exec.sh / root_exec.sh: comandos bloqueantes"
+echo "    (get/start support-bundle, tar, rsync) disparados em"
+echo "    background com disown. Output em logs/*_exec_<ip>_<ts>.log."
+echo "    Script nao trava mais aguardando CLI NSX-T."
 echo ""
 echo "Proximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./nsx_sb_precheck.sh"
