@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# nsx_sb_precheck.sh — v3.15
+# nsx_sb_precheck.sh — v3.16
 # Verifica o estado dos support bundles em todos os Edge Nodes
-# sem disparar nova geracao. Exibe tabela com status, acao e arquivo.
+# sem disparar nova geracao. Exibe tabela com status, acao, arquivo e duracao.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -32,8 +32,49 @@ if [[ "${1:-}" == "--clean-all" ]]; then
   log "=== CLEAN-ALL: Apagando TODOS os bundles existentes ==="
 fi
 
-declare -A PC_STATUS PC_ACAO PC_FILE PC_SKIP
+declare -A PC_STATUS PC_ACAO PC_FILE PC_SKIP PC_DURACAO
 now_epoch=$(date +%s)
+
+# ---------------------------------------------------------------------------
+# bundle_duration — calcula duracao entre solicitacao (nome do arquivo) e
+# criacao efetiva (mtime do arquivo no servidor).
+# Entrada : $1=ip  $2=fname (ex: sb_172_18_214_19_20260518_163036.tgz)
+# Saida   : string "Xh Ym Zs" ou "--" em caso de falha
+# ---------------------------------------------------------------------------
+bundle_duration(){
+  local ip="$1" fname="$2"
+
+  # 1) Extrai epoch do momento de solicitacao a partir do nome do arquivo
+  local req_epoch=""
+  if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})\.tgz$ ]]; then
+    local yr="${BASH_REMATCH[1]}" mo="${BASH_REMATCH[2]}" dy="${BASH_REMATCH[3]}"
+    local hh="${BASH_REMATCH[4]}" mm="${BASH_REMATCH[5]}" ss="${BASH_REMATCH[6]}"
+    req_epoch=$(date -d "${yr}-${mo}-${dy} ${hh}:${mm}:${ss}" +%s 2>/dev/null || echo "")
+  fi
+  [[ -z "$req_epoch" ]] && { printf '--'; return; }
+
+  # 2) Coleta epoch de criacao (mtime) do arquivo via stat no servidor remoto
+  local created_epoch=""
+  created_epoch=$(root_cmd "$ip" \
+    "stat -c '%Y' /var/vmware/nsx/file-store/${fname} 2>/dev/null" || echo "")
+  [[ -z "$created_epoch" || ! "$created_epoch" =~ ^[0-9]+$ ]] && { printf '--'; return; }
+
+  # 3) Calcula diferenca
+  local diff=$(( created_epoch - req_epoch ))
+  [[ $diff -lt 0 ]] && diff=0
+
+  local horas=$(( diff / 3600 ))
+  local minutos=$(( (diff % 3600) / 60 ))
+  local segundos=$(( diff % 60 ))
+
+  if [[ $horas -gt 0 ]]; then
+    printf '%dh %02dm %02ds' "$horas" "$minutos" "$segundos"
+  elif [[ $minutos -gt 0 ]]; then
+    printf '%dm %02ds' "$minutos" "$segundos"
+  else
+    printf '%ds' "$segundos"
+  fi
+}
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
@@ -42,9 +83,13 @@ for ip in "${EDGE_IPS[@]}"; do
   # Exibe ultima linha do log de geracao
   last_log="$(root_cmd "$ip" \
     "tail -1 /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND")"
-  printf '\n  +-- %s: /var/log/support_bundle.log (ultima linha) --------+\n' "$ip"
-  printf '  |  %s\n' "$last_log"
-  printf '  +--------------------------------------------------------------+\n\n'
+
+  log "${ip}: [PRE-CHECK] verificando status do support bundle..."
+
+  printf '\n  ┌─ %s: ls -lh /var/vmware/nsx/file-store/                    ─┐\n' "$ip"
+  ls_out="$(root_cmd "$ip" "ls -lh /var/vmware/nsx/file-store/ 2>/dev/null" || true)"
+  while IFS= read -r line; do printf '  │  %s\n' "$line"; done <<< "$ls_out"
+  printf '  └────────────────────────────────────────────────────────────────────────┘\n\n'
 
   if echo "$last_log" | grep -qiE 'error|fail|unable|denied'; then
     log_warn "${ip}: ultima linha do log indica possivel erro."
@@ -68,14 +113,9 @@ for ip in "${EDGE_IPS[@]}"; do
     PC_ACAO["$ip"]="LIMPO"
     PC_FILE["$ip"]="--"
     PC_SKIP["$ip"]="false"
+    PC_DURACAO["$ip"]="--"
     continue
   fi
-
-  # ls completo para contexto
-  ls_out="$(root_cmd "$ip" "ls -lh /var/vmware/nsx/file-store/ 2>/dev/null" || true)"
-  printf '\n  +-- %s: ls -lh /var/vmware/nsx/file-store/ ----------------+\n' "$ip"
-  while IFS= read -r line; do printf '  |  %s\n' "$line"; done <<< "$ls_out"
-  printf '  +--------------------------------------------------------------+\n\n'
 
   # Lista bundles
   raw_list="$(list_remote_bundles "$ip")"
@@ -119,6 +159,7 @@ for ip in "${EDGE_IPS[@]}"; do
     PC_ACAO["$ip"]="OK"
     PC_FILE["$ip"]="${newest}"
     PC_SKIP["$ip"]="true"
+    PC_DURACAO["$ip"]="$(bundle_duration "$ip" "$newest")"
     log_ok "${ip}: bundle recente presente -- geracao sera pulada."
     [[ ${#local_old[@]} -gt 0 ]] && log_warn "${ip}: bundle(s) antigo(s) presentes -- use --clean-all para remover."
   elif [[ $total_count -gt 0 ]]; then
@@ -126,12 +167,14 @@ for ip in "${EDGE_IPS[@]}"; do
     PC_ACAO["$ip"]="GERAR"
     PC_FILE["$ip"]="--"
     PC_SKIP["$ip"]="false"
+    PC_DURACAO["$ip"]="--"
     log_warn "${ip}: apenas bundle(s) antigo(s) -- sera gerado novo."
   else
     PC_STATUS["$ip"]="NENHUM"
     PC_ACAO["$ip"]="GERAR"
     PC_FILE["$ip"]="--"
     PC_SKIP["$ip"]="false"
+    PC_DURACAO["$ip"]="--"
     log "${ip}: nenhum bundle encontrado."
   fi
 
@@ -142,12 +185,12 @@ done
 # Tabela de resultado
 # ---------------------------------------------------------------------------
 precheck_csv="${LOG_DIR}/precheck_$(date +%Y%m%d_%H%M%S).csv"
-echo 'ip,status,acao,arquivo' > "$precheck_csv"
+echo 'ip,status,acao,arquivo,duracao' > "$precheck_csv"
 
 tbl_header "PRE-CHECK -- Estado dos Support Bundles"
 for ip in "${EDGE_IPS[@]}"; do
-  tbl_row "$ip" "${PC_STATUS[$ip]:-?}" "${PC_ACAO[$ip]:-?}" "${PC_FILE[$ip]:---}"
-  printf '%s,%s,%s,%s\n' "$ip" "${PC_STATUS[$ip]:-?}" "${PC_ACAO[$ip]:-?}" "${PC_FILE[$ip]:---}" \
+  tbl_row "$ip" "${PC_STATUS[$ip]:-?}" "${PC_ACAO[$ip]:-?}" "${PC_FILE[$ip]:---}" "${PC_DURACAO[$ip]:---}"
+  printf '%s,%s,%s,%s,%s\n' "$ip" "${PC_STATUS[$ip]:-?}" "${PC_ACAO[$ip]:-?}" "${PC_FILE[$ip]:---}" "${PC_DURACAO[$ip]:---}" \
     >> "$precheck_csv"
 done
 tbl_footer
