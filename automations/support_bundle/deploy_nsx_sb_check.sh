@@ -9,23 +9,21 @@
 #     com disown, evitando que o script fique preso aguardando retorno do
 #     CLI NSX-T. Output capturado em logs/admin_exec_<ip>_<ts>.log e
 #     logs/root_exec_<ip>_<ts>.log respectivamente.
-#     Comandos normais continuam com output inline.
-#     ROOT_PASS solicitada uma unica vez (root_exec).
+#     Comandos normais continuam com output inline via admin_cmd_tty/root_cmd_tty.
+#     ROOT_PASS solicitada uma unica vez para todos os nodes (root_exec).
+#     enable_root_ssh/disable_root_ssh integrados ao fluxo do root_exec.
+#     ServerAliveInterval=30 / ServerAliveCountMax=120 nas conexoes background.
 #
 # CHANGELOG v3.16.5:
 #   - FIX: bundle_duration em nsx_sb_precheck.sh.
-#     printf com '%dh %02dm %02ds' falhava com 'printf: usage' quando
-#     horas/minutos/segundos nao eram inteiros validos (diff negativo,
-#     empty string ou valor nao-numerico). Corrigido com validacao
-#     [[ ... =~ ^[0-9]+$ ]] antes de qualquer printf numerico.
 #
 # CHANGELOG v3.16.4:
 #   - FIX: nsx_sb_precheck.sh usava regex no nome do arquivo para calcular
 #     idade. Corrigido para stat -c '%Y' no node remoto.
 #
 # CHANGELOG v3.16.3:
-#   - FIX: _save_creds — senha com caracteres especiais (%, !, $, \)
-#     nao corrompe mais o arquivo de sessao.
+#   - FIX: _save_creds — senha com caracteres especiais nao corrompe mais
+#     o arquivo de sessao.
 #
 # CHANGELOG v3.16.2:
 #   - FIX: (( pc_total++ )) -> pc_total=$(( pc_total + 1 ))
@@ -647,7 +645,7 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_precheck.sh  -- v3.16.6 (sem alteracoes funcionais desde v3.16.5)
+# nsx_sb_precheck.sh  -- v3.16.6
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
 #!/usr/bin/env bash
@@ -945,9 +943,9 @@ chmod +x "${AUTO_DIR}/nsx_sb_main.sh"
 
 # ---------------------------------------------------------------------------
 # admin_exec.sh  -- v3.16.6
-# FIX: comandos bloqueantes (get/start support-bundle) disparados em
-# background com disown. Output em logs/admin_exec_<ip>_<ts>.log.
-# Comandos normais continuam com output inline.
+# FIX v3.16.6: comandos bloqueantes (get/start support-bundle) disparados em
+# background com disown + ServerAliveInterval. Output em logs/admin_exec_<ip>_<ts>.log.
+# Comandos normais continuam com output inline via admin_cmd_tty.
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/admin_exec.sh" <<'ADMX'
 #!/usr/bin/env bash
@@ -955,9 +953,10 @@ cat > "${AUTO_DIR}/admin_exec.sh" <<'ADMX'
 # Run any NSX-T admin CLI command on selected or all Edge Nodes.
 #
 # FIX v3.16.6: Comandos bloqueantes (get/start support-bundle) sao disparados
-# em background com disown, evitando que o script fique preso aguardando o
-# CLI NSX-T. Output capturado em logs/admin_exec_<ip>_<ts>.log.
-# Comandos normais continuam com output inline.
+# em background com disown + ServerAliveInterval=30, evitando que o script
+# fique preso aguardando o CLI NSX-T.
+# Output capturado em logs/admin_exec_<ip>_<ts>.log.
+# Comandos normais continuam com output inline via admin_cmd_tty.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -1040,9 +1039,11 @@ chmod +x "${AUTO_DIR}/admin_exec.sh"
 
 # ---------------------------------------------------------------------------
 # root_exec.sh  -- v3.16.6
-# FIX: comandos bloqueantes (get/start support-bundle, tar, rsync) disparados
-# em background com disown. Output em logs/root_exec_<ip>_<ts>.log.
-# ROOT_PASS solicitada uma unica vez para todos os nodes.
+# FIX v3.16.6: comandos bloqueantes (get/start support-bundle, tar, rsync)
+# disparados em background com disown + ServerAliveInterval.
+# Output em logs/root_exec_<ip>_<ts>.log.
+# ROOT_PASS solicitada uma unica vez no inicio.
+# enable_root_ssh/disable_root_ssh integrados ao fluxo.
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/root_exec.sh" <<'ROTX'
 #!/usr/bin/env bash
@@ -1051,8 +1052,10 @@ cat > "${AUTO_DIR}/root_exec.sh" <<'ROTX'
 # Enables root SSH before execution, disables after.
 #
 # FIX v3.16.6: Comandos bloqueantes (get/start support-bundle, tar, rsync)
-# sao disparados em background com disown. Output em logs/root_exec_<ip>_<ts>.log.
+# sao disparados em background com disown + ServerAliveInterval=30.
+# Output em logs/root_exec_<ip>_<ts>.log.
 # ROOT_PASS solicitada uma unica vez para todos os nodes.
+# enable_root_ssh/disable_root_ssh integrados automaticamente.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -1188,6 +1191,8 @@ do bundle (pode levar de 10 a 30 minutos). Para evitar que o script pare:
 
 - `admin_exec.sh` e `root_exec.sh` detectam automaticamente comandos
   bloqueantes e os disparam em **background** com `disown`.
+- Conexoes SSH em background usam `ServerAliveInterval=30` e
+  `ServerAliveCountMax=120` para manter a sessao ativa por ate 60 minutos.
 - O output e capturado em `logs/admin_exec_<ip>_<ts>.log` ou
   `logs/root_exec_<ip>_<ts>.log`.
 - O script retorna imediatamente e processa o proximo node.
@@ -1234,7 +1239,8 @@ echo ""
 echo "  FIX v3.16.6:"
 echo "    admin_exec.sh / root_exec.sh: comandos bloqueantes"
 echo "    (get/start support-bundle, tar, rsync) disparados em"
-echo "    background com disown. Output em logs/*_exec_<ip>_<ts>.log."
+echo "    background com disown + ServerAliveInterval=30."
+echo "    Output em logs/*_exec_<ip>_<ts>.log."
 echo "    Script nao trava mais aguardando CLI NSX-T."
 echo ""
 echo "Proximos passos:"
