@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.16.1
+# deploy_nsx_sb_check.sh  v3.16.2
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
-# USO:
-#   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
-#   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
+# CHANGELOG v3.16.2:
+#   - FIX: (( pc_total++ )) retorna exit 1 quando valor inicial e 0, causando
+#     abort silencioso com set -euo pipefail. Substituido por
+#     pc_total=$(( pc_total + 1 )) em todo o nsx_sb_precheck.sh.
 #
 # CHANGELOG v3.16.1:
-#   - FIX CRITICO: nsx_sb_precheck.sh usava 'local' fora de funcao dentro
-#     do loop 'for ip'. Com set -euo pipefail o bash abortava silenciosamente
-#     apos o primeiro node processado. Variaveis local_recent, local_old,
-#     total_count, age_days, file_epoch, newest, file_date transformadas em
-#     variaveis simples de escopo global (sem 'local').
+#   - FIX: removido 'local' fora de funcao no loop for ip.
 #
 # CHANGELOG v3.16:
-#   - nsx_sb_precheck.sh: nova coluna DURACAO no relatorio final.
-#   - common.sh: variaveis KEY_DIR, ADMIN_KEY e ROOT_KEY adicionadas.
+#   - nsx_sb_precheck.sh: nova coluna DURACAO.
+#   - common.sh: KEY_DIR, ADMIN_KEY, ROOT_KEY.
 # =============================================================================
 set -euo pipefail
 
@@ -34,7 +31,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${AUTO_DIR}/.ssh_keys" "${LIB_DIR
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.16.1"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.16.2"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -625,17 +622,19 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_precheck.sh  — v3.16.1
-# FIX: removido 'local' fora de funcao no loop for ip (causava abort com set -euo pipefail)
+# nsx_sb_precheck.sh  — v3.16.2
+# FIX: (( pc_total++ )) -> pc_total=$(( pc_total + 1 ))  evita exit 1 quando valor=0 com set -e
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_precheck.sh" <<'PRECHECK'
 #!/usr/bin/env bash
-# nsx_sb_precheck.sh  — v3.16.1
+# nsx_sb_precheck.sh  — v3.16.2
 #
-# FIX v3.16.1:
-#   Removido uso de 'local' fora de funcao no loop 'for ip'.
-#   Com set -euo pipefail, o bash abortava silenciosamente apos o 1o node.
-#   Variaveis agora sao simples (sem 'local') no escopo global do script.
+# FIX v3.16.2:
+#   (( pc_total++ )) retorna exit code 1 quando o valor inicial e 0 (falso
+#   aritmetico no bash). Com set -euo pipefail isso mata o script antes de
+#   processar qualquer bundle. Corrigido para pc_total=$(( pc_total + 1 )).
+#
+# FIX v3.16.1: removido 'local' fora de funcao no loop for ip.
 #
 # USO:
 #   ./nsx_sb_precheck.sh
@@ -659,7 +658,7 @@ declare -A PC_STATUS PC_ACAO PC_FILE PC_SKIP PC_DURACAO
 now_epoch=$(date +%s)
 
 # ---------------------------------------------------------------------------
-# bundle_duration — tempo entre solicitacao (nome) e criacao (mtime)
+# bundle_duration — tempo entre solicitacao (nome do arquivo) e criacao (mtime)
 # ---------------------------------------------------------------------------
 bundle_duration(){
   local ip="$1" fname="$2" req_epoch="" created_epoch=""
@@ -693,13 +692,12 @@ for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
 
   echo ""
-  printf '  \u250c\u2500 %s: ls -lh /var/vmware/nsx/file-store/ \u2500\u2510\n' "$ip"
+  printf '  \u250c\u2500 %s: ls -lh /var/vmware/nsx/file-store/                    \u2500\u2510\n' "$ip"
   ls_out="$(root_cmd "$ip" "ls -lh /var/vmware/nsx/file-store/ 2>/dev/null" || true)"
   while IFS= read -r line; do printf '  \u2502  %s\n' "$line"; done <<< "$ls_out"
   printf '  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\n'
 
   if [[ "$CLEAN_ALL" == true ]]; then
-    # Limpar todos os bundles
     rm_list="$(root_cmd "$ip" "ls /var/vmware/nsx/file-store/ 2>/dev/null | grep -E '\.tgz$' || true")"
     while IFS= read -r f; do
       [[ -z "$f" ]] && continue
@@ -713,17 +711,18 @@ for ip in "${EDGE_IPS[@]}"; do
     continue
   fi
 
-  # Listar bundles existentes
+  # Listar bundles — grep com || true garante exit 0 quando nao ha .tgz
   raw_list="$(root_cmd "$ip" "ls /var/vmware/nsx/file-store/ 2>/dev/null" | grep -E '\.tgz$' || true)"
   log "${ip}: [bundles detectados] resultado bruto: '${raw_list:-<vazio>}'"
 
-  # --- SEM 'local' abaixo (estamos no escopo global do script) ---
   pc_recent=(); pc_old=()
   pc_total=0
 
   while IFS= read -r fname; do
     [[ -z "$fname" ]] && continue
-    (( pc_total++ ))
+    # FIX v3.16.2: usar atribuicao aritmetica em vez de (( ++ )) para evitar
+    # exit code 1 quando pc_total=0 com set -e ativo
+    pc_total=$(( pc_total + 1 ))
     pc_age_days=0
     if [[ "$fname" =~ _([0-9]{4})([0-9]{2})([0-9]{2})_[0-9]{6}\.tgz$ ]]; then
       pc_file_epoch=$(date -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}" +%s 2>/dev/null || echo "$now_epoch")
@@ -735,7 +734,7 @@ for ip in "${EDGE_IPS[@]}"; do
     [[ $pc_age_days -le 7 ]] && pc_recent+=("$fname") || pc_old+=("$fname")
   done <<< "$raw_list"
 
-  log "${ip}: ${pc_total} bundle(s) encontrado(s) | ${#pc_recent[@]} recente(s) | ${#pc_old[@]} antigo(s)."
+  log "${ip}: ${pc_total} bundle(s) | ${#pc_recent[@]} recente(s) | ${#pc_old[@]} antigo(s)."
 
   printf '\n  +-- %s: %d recente(s) (<=7d) | %d antigo(s) (>7d) ---+\n' \
     "$ip" "${#pc_recent[@]}" "${#pc_old[@]}"
@@ -792,11 +791,11 @@ PRECHECK
 chmod +x "${AUTO_DIR}/nsx_sb_precheck.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.16.1
+# nsx_sb_main.sh  — v3.16.2 (sem alteracoes funcionais)
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.16.1
+# nsx_sb_main.sh  — v3.16.2
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -997,7 +996,7 @@ CLISCRIPT
 chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.16.1
+# NSX Edge Automation — Manual de Uso  v3.16.2
 
 ## Scripts disponiveis
 
@@ -1035,12 +1034,12 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluido! v3.16.1"
+echo "  Deploy concluido! v3.16.2"
 echo "================================================================"
 echo ""
-echo "  FIX v3.16.1:"
-echo "    nsx_sb_precheck.sh — corrigido abort silencioso apos 1o node"
-echo "    (removido 'local' fora de funcao no loop for ip)"
+echo "  FIX v3.16.2:"
+echo "    nsx_sb_precheck.sh — (( pc_total++ )) substituido por"
+echo "    pc_total=\$(( pc_total + 1 )) para evitar abort com set -e"
 echo ""
 echo "Proximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./nsx_sb_precheck.sh"
